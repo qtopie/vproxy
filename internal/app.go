@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/qtopie/vproxy/internal/mitm"
 	"github.com/qtopie/vproxy/proxy/cgroup"
 	"github.com/qtopie/vproxy/proxy/ebpf"
 	"github.com/qtopie/vproxy/proxy/iptables"
@@ -36,8 +37,21 @@ func (a *App) RunServer() {
 	if err := ph.StartHTTP(); err != nil {
 		log.Fatalf("Failed to start HTTP proxy: %v", err)
 	}
-	if err := ph.StartTransparent(); err != nil {
-		log.Fatalf("Failed to start transparent proxy: %v", err)
+
+	best := sm.GetBestServer()
+	isUpstreamTProxyAlive := false
+	if best != "" {
+		if u, err := url.Parse(best); err == nil && u.Scheme == "tproxy" {
+			isUpstreamTProxyAlive = true
+		}
+	}
+
+	if !isUpstreamTProxyAlive {
+		if err := ph.StartTransparent(); err != nil {
+			log.Fatalf("Failed to start transparent proxy: %v", err)
+		}
+	} else {
+		Debugf("Upstream provides tproxy directly and is ALIVE: %s, not starting local transparent proxy in server mode", best)
 	}
 
 	a.PrintConnectivityOK()
@@ -60,12 +74,35 @@ func (a *App) RunWrapper(args []string) {
 	baseName := filepath.Base(args[0])
 	needsEbpf := true
 	switch baseName {
-	case "curl", "git", "code":
+	case "curl", "git", "code", "gemini", "antigravity":
 		needsEbpf = false
 	}
 
 	sm, ph := a.setupServices()
 	sm.Start()
+
+	// Simplified upstream selection
+	best := sm.GetBestServer()
+	isUpstreamTProxyAlive := false
+	if best != "" {
+		if u, err := url.Parse(best); err == nil && u.Scheme == "tproxy" {
+			isUpstreamTProxyAlive = true
+		}
+	}
+
+	if best == "" {
+		servers := sm.GetServers()
+		if len(servers) > 0 {
+			best = servers[0]
+			Debugf("No verified upstream yet, defaulting to first: %s", best)
+		} else {
+			log.Fatal("No upstream servers configured")
+		}
+	} else {
+		Debugf("Using verified upstream: %s", best)
+	}
+
+	bestURL, _ := url.Parse(best)
 
 	cleanup := func() {
 		if needsEbpf && runtime.GOOS == "linux" {
@@ -98,15 +135,14 @@ func (a *App) RunWrapper(args []string) {
 				user := os.Getenv("USER")
 				if user == "" { user = "root" }
 				
-				// Idempotent fix: setcap and ensure cgroup directory
 				fixCmd := fmt.Sprintf(
-					"sudo setcap cap_net_admin,cap_bpf,cap_sys_resource+ep %s && " +
+					"sudo setcap cap_net_admin,cap_net_bind_service,cap_bpf,cap_sys_resource+ep %s && " +
 					"sudo mkdir -p /sys/fs/cgroup/vproxy && " +
 					"sudo chown -R %s /sys/fs/cgroup/vproxy",
 					exe, user,
 				)
 				
-				fmt.Printf("\n[+] Applying fixes...\n")
+				fmt.Printf("\n[+] Configuring Permissions...\n")
 				exec.Command("bash", "-c", fixCmd).Run()
 
 				fmt.Printf("[+] Permissions updated. Restarting vproxy...\n\n")
@@ -132,12 +168,19 @@ func (a *App) RunWrapper(args []string) {
 		ebpf.SetEnabled(true)
 		SetDialerControl(ebpf.GetDialerControl())
 
-		// Setup iptables REDIRECT rules for the cgroup
-		if err := ph.StartTransparent(); err != nil {
-			log.Fatalf("Failed to start transparent bridge: %v", err)
-		}
-		if err := iptables.SetupRules(ph.TransPort); err != nil {
-			log.Fatalf("Fatal: iptables setup failed: %v", err)
+		// Setup iptables rules for the cgroup
+		if isUpstreamTProxyAlive {
+			Debugf("Upstream provides tproxy directly and is ALIVE: %s, forwarding directly without starting local transparent proxy", bestURL.Host)
+			if err := iptables.SetupRules(bestURL.Host); err != nil {
+				log.Fatalf("Fatal: iptables setup failed: %v", err)
+			}
+		} else {
+			if err := ph.StartTransparent(); err != nil {
+				log.Fatalf("Failed to start transparent bridge: %v", err)
+			}
+			if err := iptables.SetupRules(fmt.Sprintf("%d", ph.TransPort)); err != nil {
+				log.Fatalf("Fatal: iptables setup failed: %v", err)
+			}
 		}
 
 		// Ensure cleanup on unexpected signals
@@ -149,25 +192,17 @@ func (a *App) RunWrapper(args []string) {
 			os.Exit(1)
 		}()
 	}
-
-	// Simplified upstream selection
-	best := sm.GetBestServer()
-	if best == "" {
-		servers := sm.GetServers()
-		if len(servers) > 0 {
-			best = servers[0]
-			Debugf("No verified upstream yet, defaulting to first: %s", best)
-		} else {
-			log.Fatal("No upstream servers configured")
-		}
-	} else {
-		Debugf("Using verified upstream: %s", best)
-	}
-
-	bestURL, _ := url.Parse(best)
 	cmdName := args[0]
 	cmdArgs := args[1:]
 	env := os.Environ()
+	if IsVerbose() {
+		if err := mitm.EnsureCA(); err == nil {
+			env = append(env, fmt.Sprintf("SSL_CERT_FILE=%s", mitm.GetCACertPath()))
+			Debugf("Tracing CA injected into environment: SSL_CERT_FILE=%s", mitm.GetCACertPath())
+		} else {
+			Errorf("Failed to initialize dynamic CA: %v", err)
+		}
+	}
 
 	var finalHTTPProxy string
 	var finalSocksProxy string
@@ -175,7 +210,7 @@ func (a *App) RunWrapper(args []string) {
 	var isHTTPTool bool
 	baseName = filepath.Base(cmdName)
 	switch baseName {
-	case "curl", "git", "gemini", "antigravity":
+	case "curl", "git", "gemini":
 		isHTTPTool = true
 	default:
 		isHTTPTool = false
@@ -214,7 +249,7 @@ func (a *App) RunWrapper(args []string) {
 	case "code":
 		// VS Code uses --proxy-server argument
 		newArgs = append([]string{fmt.Sprintf("--proxy-server=%s", finalHTTPProxy)}, cmdArgs...)
-	case "git", "gemini", "antigravity":
+	case "git", "gemini":
 		env = append(env, fmt.Sprintf("HTTP_PROXY=%s", finalHTTPProxy))
 		env = append(env, fmt.Sprintf("HTTPS_PROXY=%s", finalHTTPProxy))
 		env = a.appendNoProxyEnv(env)

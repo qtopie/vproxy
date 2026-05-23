@@ -17,6 +17,17 @@ const (
 
 // EnsureVProxyCgroup ensures that the vproxy cgroup exists and is owned by the current user.
 func EnsureVProxyCgroup() error {
+	// Try checking if it already exists and is writable first to avoid sudo
+	fi, err := os.Stat(defaultCgroupPath)
+	if err == nil && fi.IsDir() {
+		testFile := filepath.Join(defaultCgroupPath, "cgroup.procs")
+		f, err := os.OpenFile(testFile, os.O_WRONLY, 0)
+		if err == nil {
+			f.Close()
+			return nil // Already exists and is writable by the current user! No sudo needed.
+		}
+	}
+
 	user := os.Getenv("USER")
 	if user == "" {
 		user = "root"

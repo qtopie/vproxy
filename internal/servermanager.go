@@ -35,10 +35,10 @@ func NewServerManager(servers []string, testInterval, testTimeout time.Duration)
 // Start begins the periodic testing of servers in a background goroutine.
 func (sm *ServerManager) Start() {
 	log.Println("ServerManager: Starting...")
-	go func() {
-		// Perform an initial test immediately.
-		sm.testServers()
+	// Perform an initial test synchronously.
+	sm.testServers()
 
+	go func() {
 		ticker := time.NewTicker(sm.testInterval)
 		defer ticker.Stop()
 
@@ -161,6 +161,8 @@ func (sm *ServerManager) testServers() {
 					dialAddr += ":443"
 				case "socks5":
 					dialAddr += ":1080"
+				case "tproxy":
+					dialAddr += ":10080"
 				}
 			}
 		}

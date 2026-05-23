@@ -3,7 +3,7 @@
 
 package iptables
 
-func SetupRules(proxyPort int) error {
+func SetupRules(target string) error {
 	return nil
 }
 

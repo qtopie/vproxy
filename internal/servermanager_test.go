@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -55,5 +56,25 @@ func TestServerManager_FirstFailed(t *testing.T) {
 	best := sm.GetBestServer()
 	if best != s2.URL {
 		t.Errorf("Expected active server to be %s (first working), got %s", s2.URL, best)
+	}
+}
+
+func TestServerManager_TProxy(t *testing.T) {
+	// Create a test tproxy server (which is a TCP listener)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	addr := ln.Addr().String() // "127.0.0.1:port"
+	tproxyURL := "tproxy://" + addr
+
+	sm := NewServerManager([]string{tproxyURL}, 1*time.Minute, 1*time.Second)
+	sm.testServers()
+
+	best := sm.GetBestServer()
+	if best != tproxyURL {
+		t.Errorf("Expected active server to be %s, got %s", tproxyURL, best)
 	}
 }
