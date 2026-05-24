@@ -120,6 +120,25 @@ func (ph *ProxyHandler) StartTransparent() error {
 		return nil
 	}
 
+	if runtime.GOOS == "windows" {
+		SetDialerControl(tproxy.GetDialerControl())
+		go func() {
+			err := tproxy.StartWindowsTransparent(context.Background(), func(conn net.Conn) {
+				defer conn.Close()
+				target, err := tproxy.GetOriginalDst(conn)
+				if err != nil {
+					log.Printf("Failed to get original destination: %v", err)
+					return
+				}
+				ph.forward(conn, target)
+			}, ph.handleUDP)
+			if err != nil {
+				log.Printf("Failed to start Windows transparent proxy: %v", err)
+			}
+		}()
+		return nil
+	}
+
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", ph.TransPort))
 	if err != nil {
 		log.Printf("Transparent proxy port %d is already in use, binding to a free port instead...", ph.TransPort)
@@ -146,7 +165,7 @@ func (ph *ProxyHandler) StartTransparent() error {
 func (ph *ProxyHandler) handleUDP(ctx context.Context, local net.Conn, target string) {
 	defer local.Close()
 	process := ""
-	if runtime.GOOS == "darwin" {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
 		process, _ = tproxy.GetProcessNameByConn(local)
 	}
 	upstream, err := ph.dialTargetUDP(target, process)
@@ -237,7 +256,7 @@ func (ph *ProxyHandler) serveTransparentUDP() {
 		var upstream net.Conn
 		if !loaded {
 			process := ""
-			if runtime.GOOS == "darwin" {
+			if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
 				process, _ = tproxy.GetProcessNameByPort(src.Port)
 			}
 			Infof("[UDP] Intercepted new UDP session from %s (Process: %s) targeting %s", src.String(), process, dst.String())
@@ -319,7 +338,7 @@ func (ph *ProxyHandler) serveHTTP() {
 			// Deep HTTPS Tracing (MITM) when verbose/debug mode is enabled
 			if IsVerbose() {
 				process := ""
-				if runtime.GOOS == "darwin" {
+				if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
 					process, _ = tproxy.GetProcessNameByConn(conn)
 				}
 				// Establish TLS connection with the target server
@@ -561,7 +580,7 @@ func (ph *ProxyHandler) dialTargetUDP(target string, process string) (net.Conn, 
 
 func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 	process := ""
-	if runtime.GOOS == "darwin" {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
 		process, _ = tproxy.GetProcessNameByConn(conn)
 	}
 

@@ -65,7 +65,7 @@ func (a *App) RunServer() {
 	<-sigCh
 
 	Debugf("Shutting down...")
-	if runtime.GOOS == "darwin" {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
 		tproxy.Cleanup()
 	}
 	ph.Stop()
@@ -117,7 +117,7 @@ func (a *App) RunWrapper(args []string) {
 			// iptables fallback: clean up rules on exit.
 			iptables.CleanupRules()
 		}
-		if runtime.GOOS == "darwin" {
+		if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
 			tproxy.Cleanup()
 		}
 		ph.Stop()

@@ -5,6 +5,7 @@ package tproxy
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
@@ -106,6 +107,19 @@ func StartDarwinTransparent(ctx context.Context, tcpHandler func(net.Conn), udpH
 	if err := s.CreateNIC(1, channelEndpoint); err != nil {
 		return fmt.Errorf("failed to create NIC: %v", err)
 	}
+
+	// Assign an IP address so gvisor accepts inbound packets.
+	tunIP := [4]byte{198, 18, 0, 1}
+	if tcpipErr := s.AddProtocolAddress(1, tcpip.ProtocolAddress{
+		Protocol: ipv4.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddressWithPrefix{
+			Address:   tcpip.AddrFrom4(tunIP),
+			PrefixLen: 15, // 198.18.0.0/15 (RFC 5737 non-routable range)
+		},
+	}, stack.AddressProperties{}); tcpipErr != nil {
+		log.Printf("[TUN] Warning: AddProtocolAddress: %v", tcpipErr)
+	}
+
 	s.SetRouteTable([]tcpip.Route{
 		{
 			Destination: header.IPv4EmptySubnet,
@@ -144,15 +158,12 @@ func StartDarwinTransparent(ctx context.Context, tcpHandler func(net.Conn), udpH
 		target := fmt.Sprintf("%s:%d", endpoint.LocalAddress, endpoint.LocalPort)
 		log.Printf("[TUN] Intercepted UDP packet to %s", target)
 
-		addr := tcpip.FullAddress{
-			Addr: endpoint.LocalAddress,
-			Port: endpoint.LocalPort,
-		}
-		conn, err := gonet.DialUDP(s, nil, &addr, ipv4.ProtocolNumber)
+		var wq waiter.Queue
+		ep, err := r.CreateEndpoint(&wq)
 		if err != nil {
 			return false
 		}
-		go udpHandler(context.Background(), conn, target)
+		go udpHandler(context.Background(), gonet.NewUDPConn(&wq, ep), target)
 		return true
 	}
 	udpForwarder := udp.NewForwarder(s, udpHandlerFunc)
@@ -209,12 +220,25 @@ func bridgeTun(dev tun.Device, ep *channel.Endpoint) {
 		outPacket := make([]byte, len(buf)+offset)
 		copy(outPacket[offset:], buf)
 
+		// Set AF_INET (2) or AF_INET6 (30) in big-endian in first 4 bytes
+		if len(buf) > 0 && (buf[0]>>4) == 6 {
+			binary.BigEndian.PutUint32(outPacket[:4], syscall.AF_INET6) // 30
+		} else {
+			binary.BigEndian.PutUint32(outPacket[:4], syscall.AF_INET)  // 2
+		}
+
 		dev.Write([][]byte{outPacket}, offset)
 		view.Release()
 	}
 }
 
 func setupRouting(tunName string) error {
+	// 0. Configure the TUN interface IP address
+	// Assign a point-to-point address pair to the utun interface
+	if err := exec.Command("ifconfig", tunName, "198.18.0.1", "198.18.0.2", "up").Run(); err != nil {
+		return fmt.Errorf("failed to ifconfig %s: %v", tunName, err)
+	}
+
 	// 1. Get default interface
 	iface, err := getDefaultInterface()
 	if err != nil {
@@ -288,15 +312,14 @@ func GetDialerControl() func(network, address string, c syscall.RawConn) error {
 		var opErr error
 		err := c.Control(func(fd uintptr) {
 			// macOS: IP_BOUND_IF
-			// For IPv4
-			if strings.HasPrefix(network, "tcp4") || strings.HasPrefix(network, "udp4") {
+			switch network {
+			case "tcp4", "udp4":
 				opErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, 0x19 /* IP_BOUND_IF */, index)
-			} else if strings.HasPrefix(network, "tcp6") || strings.HasPrefix(network, "udp6") {
+			case "tcp6", "udp6":
 				opErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, 0x19 /* IPV6_BOUND_IF */, index)
-			} else {
-				// Try both if network is generic "tcp" or "udp"
-				syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, 0x19, index)
-				syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, 0x19, index)
+			default:
+				_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, 0x19, index)
+				_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, 0x19, index)
 			}
 		})
 		if err != nil {
