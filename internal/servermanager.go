@@ -186,8 +186,11 @@ func (sm *ServerManager) testServers() {
 			log.Printf("ServerManager: Active server set to %s", sm.activeServer)
 		}
 	} else {
+		if len(servers) > 0 {
+			Errorf("All %d upstream servers are unreachable", len(servers))
+		}
 		if sm.activeServer != "" {
-			log.Println("ServerManager: All servers unreachable, clearing active server")
+			log.Println("ServerManager: Clearing active server")
 			sm.activeServer = ""
 		}
 	}

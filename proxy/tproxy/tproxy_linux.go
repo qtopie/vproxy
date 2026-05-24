@@ -138,3 +138,5 @@ func lookupTCPFromMap(conn net.Conn, m TCPOrigDstMap) (string, error) {
 	binary.BigEndian.PutUint32(b, dst.IP[0])
 	return fmt.Sprintf("%s:%d", net.IP(b).String(), port), nil
 }
+
+func Cleanup() {}

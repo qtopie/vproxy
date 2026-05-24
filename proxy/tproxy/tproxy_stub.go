@@ -1,5 +1,5 @@
-//go:build !linux
-// +build !linux
+//go:build !linux && !darwin
+// +build !linux,!darwin
 
 package tproxy
 
@@ -35,5 +35,7 @@ func DialUDPTransparent(origDst *net.UDPAddr) (*net.UDPConn, error) {
 func ReadFromUDPWithOrigDst(conn *net.UDPConn, b []byte, oob []byte) (n int, src *net.UDPAddr, dst *net.UDPAddr, err error) {
 	return 0, nil, nil, fmt.Errorf("udp transparent proxy not supported on this platform")
 }
+
+func Cleanup() {}
 
 

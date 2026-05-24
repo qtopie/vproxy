@@ -1,12 +1,19 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
 
 	vlink "github.com/qtopie/vproxy/internal"
+	"github.com/qtopie/vproxy/proxy/tproxy"
 )
 
 var (
@@ -19,6 +26,28 @@ var (
 
 func main() {
 	flag.Parse()
+	args := flag.Args()
+
+	// Handle 'clean' command
+	if len(args) > 0 && args[0] == "clean" {
+		if os.Geteuid() != 0 {
+			log.Fatal("'clean' command requires sudo privileges")
+		}
+		stopBackgroundServer()
+		vlink.SetVerbose(*verbose)
+		tproxy.Cleanup()
+		fmt.Println("vproxy: environment cleaned.")
+		return
+	}
+
+	// Handle 'init' command
+	if len(args) > 0 && args[0] == "init" {
+		if os.Geteuid() != 0 {
+			log.Fatal("'init' command requires sudo privileges")
+		}
+		startBackgroundServer(*configPath)
+		return
+	}
 
 	cfg, finalPath, err := vlink.LoadConfig(*configPath)
 	if err != nil {
@@ -30,15 +59,14 @@ func main() {
 		vlink.SetVerbose(true)
 	}
 
+	// Redirect logs to a file to keep console clean for the wrapped command
 	logPath := fmt.Sprintf("/tmp/vproxy-%d.log", os.Getpid())
-	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err == nil {
-		vlink.SetOutput(f)
-		// We don't Close(f) here because the logger needs it. 
-		// The OS will close it when the process exits.
-		fmt.Fprintf(os.Stderr, "Logging to %s\n", logPath)
-	} else {
-		log.Printf("Failed to open log file %s: %v", logPath, err)
+	if len(args) > 0 {
+		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err == nil {
+			vlink.SetOutput(f)
+			fmt.Fprintf(os.Stderr, "vproxy: logging to %s\n", logPath)
+		}
 	}
 
 	vproxy := &vlink.App{
@@ -49,11 +77,84 @@ func main() {
 		LocalTrans: *localTrans,
 	}
 
-	args := flag.Args()
 	if len(args) > 0 {
+		// If it's a command like 'vproxy agy'
+		cmdName := args[0]
+		
+		// 1. Ensure the command is in our PROCESS proxy list
+		ensureProcessInConfig(finalPath, cfg, cmdName)
+		
+		// 2. Run the command. 
+		// If a background vproxy is already running TUN, we don't need to wrap it with env vars,
+		// but we do it anyway as a fallback.
 		vproxy.RunWrapper(args)
 		return
 	}
 
+	// Default: Run as foreground server
 	vproxy.RunServer()
 }
+
+const pidFile = "/tmp/vproxy.pid"
+
+func startBackgroundServer(config string) {
+	// Check if already running
+	if _, err := os.Stat(pidFile); err == nil {
+		fmt.Println("vproxy is already running. Run 'vproxy clean' first if you want to restart.")
+		return
+	}
+
+	binary, _ := os.Executable()
+	cmd := exec.Command(binary, "-c", config)
+	// Inherit environment but set a marker
+	cmd.Env = append(os.Environ(), "VP_BACKGROUND=1")
+	
+	// Open log file for background process in the local directory so it can be inspected
+	logFile := "vproxy.log"
+	f, _ := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	cmd.Stdout = f
+	cmd.Stderr = f
+	
+	err := cmd.Start()
+	if err != nil {
+		log.Fatalf("Failed to start background server: %v", err)
+	}
+
+	os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", cmd.Process.Pid)), 0644)
+	fmt.Printf("vproxy: started in background (PID: %d, Log: %s)\n", cmd.Process.Pid, logFile)
+	fmt.Println("vproxy: TUN environment initialized.")
+}
+
+func stopBackgroundServer() {
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		return
+	}
+	pid, _ := strconv.Atoi(string(data))
+	process, err := os.FindProcess(pid)
+	if err == nil {
+		process.Signal(syscall.SIGTERM)
+		// Wait a bit for cleanup
+		time.Sleep(1 * time.Second)
+	}
+	os.Remove(pidFile)
+}
+
+func ensureProcessInConfig(path string, cfg *vlink.Config, proc string) {
+	rule := fmt.Sprintf("PROCESS,%s,PROXY", proc)
+	exists := false
+	for _, r := range cfg.Rules {
+		if strings.Contains(r, proc) {
+			exists = true
+			break
+		}
+	}
+	if !exists {
+		cfg.Rules = append(cfg.Rules, rule)
+		// Save back to config
+		data, _ := json.MarshalIndent(cfg, "", "  ")
+		os.WriteFile(path, data, 0644)
+		fmt.Printf("vproxy: added '%s' to proxy rules\n", proc)
+	}
+}
+

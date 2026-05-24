@@ -12,6 +12,7 @@ type Config struct {
 	Rules        []string `json:"rules"`
 	TestInterval int      `json:"test_interval"` // seconds
 	EnableEbpf   *bool    `json:"enable_ebpf,omitempty"`
+	DirectDNS    *bool    `json:"direct_dns,omitempty"`
 }
 
 // LoadConfig loads the configuration from the given path, with fallbacks to global and local defaults.
@@ -65,6 +66,10 @@ func LoadConfig(path string) (*Config, string, error) {
 	// 6. Apply defaults if missing
 	if cfg.TestInterval == 0 {
 		cfg.TestInterval = 30
+	}
+	if cfg.DirectDNS == nil {
+		trueVal := true
+		cfg.DirectDNS = &trueVal
 	}
 
 	return &cfg, finalPath, nil

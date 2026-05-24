@@ -18,6 +18,7 @@ import (
 	"github.com/qtopie/vproxy/proxy/cgroup"
 	"github.com/qtopie/vproxy/proxy/ebpf"
 	"github.com/qtopie/vproxy/proxy/iptables"
+	"github.com/qtopie/vproxy/proxy/tproxy"
 )
 
 type App struct {
@@ -64,6 +65,9 @@ func (a *App) RunServer() {
 	<-sigCh
 
 	Debugf("Shutting down...")
+	if runtime.GOOS == "darwin" {
+		tproxy.Cleanup()
+	}
 	ph.Stop()
 	sm.Stop()
 }
@@ -94,7 +98,7 @@ func (a *App) RunWrapper(args []string) {
 		servers := sm.GetServers()
 		if len(servers) > 0 {
 			best = servers[0]
-			Debugf("No verified upstream yet, defaulting to first: %s", best)
+			Errorf("No verified upstream available, defaulting to first: %s", best)
 		} else {
 			log.Fatal("No upstream servers configured")
 		}
@@ -113,13 +117,22 @@ func (a *App) RunWrapper(args []string) {
 			// iptables fallback: clean up rules on exit.
 			iptables.CleanupRules()
 		}
+		if runtime.GOOS == "darwin" {
+			tproxy.Cleanup()
+		}
 		ph.Stop()
 		sm.Stop()
 	}
 	defer cleanup()
 
 	// 1. Setup Transparent Proxying Components
-	if a.Config.EnableEbpf != nil && *a.Config.EnableEbpf && runtime.GOOS == "linux" && needsEbpf {
+	skipPrivileged := false
+	if _, err := os.Stat("/tmp/vproxy.pid"); err == nil {
+		skipPrivileged = true
+		Debugf("Background vproxy detected, skipping privileged transparent proxy setup")
+	}
+
+	if !skipPrivileged && a.Config.EnableEbpf != nil && *a.Config.EnableEbpf && runtime.GOOS == "linux" && needsEbpf {
 		// Check if we have permissions to set SO_MARK (requires CAP_NET_ADMIN)
 		if err := ebpf.CheckPermission(); err != nil {
 			if os.Getenv("VP_FIX_ATTEMPTED") == "1" {
@@ -226,6 +239,28 @@ func (a *App) RunWrapper(args []string) {
 		} else {
 			Errorf("Failed to initialize dynamic CA: %v", err)
 		}
+	}
+
+	// If background vproxy is running, we don't need to set environment variables
+	// because TUN will intercept the traffic directly.
+	if skipPrivileged {
+		Debugf("Background vproxy detected, executing %s directly (letting TUN handle it)", cmdName)
+		cmd := exec.Command(cmdName, cmdArgs...)
+		cmd.Env = env
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin
+
+		err := cmd.Run()
+		cleanup()
+
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				os.Exit(exitErr.ExitCode())
+			}
+			log.Fatalf("Command execution failed: %v", err)
+		}
+		return
 	}
 
 	var finalHTTPProxy string
@@ -344,6 +379,9 @@ func (a *App) setupServices() (*ServerManager, *ProxyHandler) {
 	}
 
 	rm := NewRuleManager(a.Config.Rules)
+	if a.Config.DirectDNS != nil {
+		rm.SetDirectDNS(*a.Config.DirectDNS)
+	}
 	ph := NewProxyHandler(sm, rm, a.LocalSocks, a.LocalHTTP, a.LocalTrans)
 	return sm, ph
 }
@@ -365,7 +403,11 @@ func (a *App) watchConfig(path string, ph *ProxyHandler) {
 			cfg, _, err := LoadConfig(path)
 			if err == nil {
 				ph.UpdateServers(cfg.Upstreams)
-				ph.UpdateRules(cfg.Rules)
+				directDNS := true
+				if cfg.DirectDNS != nil {
+					directDNS = *cfg.DirectDNS
+				}
+				ph.UpdateRules(cfg.Rules, directDNS)
 				Debugf("Config reloaded")
 			}
 		}
