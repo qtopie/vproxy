@@ -43,10 +43,13 @@ type Rule struct {
 }
 
 // MatchContext provides context for rule matching.
+// On macOS, Process holds the full executable path returned by proc_pidpath
+// (e.g. "/Applications/Telegram.app/Contents/MacOS/Telegram").
+// On other platforms it is the process command name.
 type MatchContext struct {
 	Host    string
 	Port    int
-	Process string
+	Process string // full executable path on macOS, command name elsewhere
 }
 
 // RuleManager manages a set of routing rules.
@@ -58,10 +61,16 @@ type RuleManager struct {
 
 // NewRuleManager creates a new RuleManager from a list of rules.
 // Rules can be:
-// - "DOMAIN,example.com,PROXY"
-// - "PROCESS,Telegram,DIRECT"
-// - "example.com,PROXY" (defaults to DOMAIN)
-// - "DEFAULT,DIRECT"
+//   - "DOMAIN,example.com,PROXY"
+//   - "PROCESS,Telegram,DIRECT"                        (name substring — backward compatible)
+//   - "PROCESS,/Applications/Telegram.app,DIRECT"      (path-prefix match, more precise)
+//   - "example.com,PROXY"                              (defaults to DOMAIN)
+//   - "DEFAULT,DIRECT"
+//
+// PROCESS rules perform a case-insensitive substring match against the full
+// executable path of the process (on macOS) or its command name (elsewhere).
+// This means both short names like "Telegram" and path prefixes like
+// "/Applications/Telegram.app" correctly identify the same process.
 func NewRuleManager(ruleEntries []string) *RuleManager {
 	rm := &RuleManager{
 		rules:     make([]Rule, 0),
