@@ -13,21 +13,20 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// ListenUDPTransparent opens a UDP socket with IP_TRANSPARENT and IP_RECVORIGDSTADDR
-// bound to the given port for capturing TPROXY traffic.
+// ListenUDPTransparent opens an IPv4 UDP socket with IP_TRANSPARENT and
+// IP_RECVORIGDSTADDR for capturing iptables TPROXY-redirected traffic.
+// Used in iptables fallback mode.
 func ListenUDPTransparent(port int) (*net.UDPConn, error) {
 	lc := net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
 			var opErr error
 			err := c.Control(func(fd uintptr) {
-				// Set IP_TRANSPARENT to allow receiving intercepted traffic
 				if err := unix.SetsockoptInt(int(fd), unix.SOL_IP, unix.IP_TRANSPARENT, 1); err != nil {
 					opErr = fmt.Errorf("failed to set IP_TRANSPARENT: %w", err)
 					return
 				}
 				unix.SetsockoptInt(int(fd), unix.SOL_IPV6, unix.IPV6_TRANSPARENT, 1)
 
-				// Set IP_RECVORIGDSTADDR to get original destination address
 				if err := unix.SetsockoptInt(int(fd), unix.SOL_IP, unix.IP_RECVORIGDSTADDR, 1); err != nil {
 					opErr = fmt.Errorf("failed to set IP_RECVORIGDSTADDR: %w", err)
 					return
@@ -40,7 +39,6 @@ func ListenUDPTransparent(port int) (*net.UDPConn, error) {
 			return opErr
 		},
 	}
-	// Bind to 0.0.0.0 so we can receive packets redirected to local delivery by TPROXY
 	conn, err := lc.ListenPacket(context.Background(), "udp", fmt.Sprintf("0.0.0.0:%d", port))
 	if err != nil {
 		return nil, err
@@ -48,9 +46,41 @@ func ListenUDPTransparent(port int) (*net.UDPConn, error) {
 	return conn.(*net.UDPConn), nil
 }
 
-// DialUDPTransparent creates a UDP socket bound to the specific IP:PORT 
+// ListenUDP4Direct opens a plain IPv4 UDP socket bound to 127.0.0.1:port.
+// Used in eBPF mode where the BPF hook already rewrites the destination to
+// 127.0.0.1:proxy_port; no IP_TRANSPARENT needed.
+func ListenUDP4Direct(port int) (*net.UDPConn, error) {
+	conn, err := net.ListenPacket("udp4", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return nil, err
+	}
+	return conn.(*net.UDPConn), nil
+}
+
+// ListenUDP6Direct opens a plain IPv6 UDP socket bound to [::1]:port.
+// Used in eBPF mode for IPv6 UDP traffic redirected to ::1:proxy_port.
+func ListenUDP6Direct(port int) (*net.UDPConn, error) {
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				// Ensure this socket is IPv6-only so it doesn't conflict
+				// with the IPv4 listener on the same port.
+				unix.SetsockoptInt(int(fd), unix.SOL_IPV6, unix.IPV6_V6ONLY, 1)
+			})
+		},
+	}
+	conn, err := lc.ListenPacket(context.Background(), "udp6", fmt.Sprintf("[::1]:%d", port))
+	if err != nil {
+		return nil, err
+	}
+	return conn.(*net.UDPConn), nil
+}
+
+// DialUDPTransparent creates a UDP socket bound to the specific IP:PORT
 // (which can be a non-local address, i.e., the original destination of a packet).
-// This allows us to send replies to the client that appear to come from the destination it originally targeted.
+// This allows sending replies to the client that appear to come from the
+// destination it originally targeted.
+// Used only in iptables TPROXY mode.
 func DialUDPTransparent(origDst *net.UDPAddr) (*net.UDPConn, error) {
 	lc := net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
@@ -76,7 +106,9 @@ func DialUDPTransparent(origDst *net.UDPAddr) (*net.UDPConn, error) {
 	return conn.(*net.UDPConn), nil
 }
 
-// ReadFromUDPWithOrigDst reads a UDP packet and extracts its original destination address from the OOB data.
+// ReadFromUDPWithOrigDst reads a UDP packet and extracts its original destination
+// address from the OOB cmsg data (IP_RECVORIGDSTADDR / IPV6_RECVORIGDSTADDR).
+// Used in iptables TPROXY mode.
 func ReadFromUDPWithOrigDst(conn *net.UDPConn, b []byte, oob []byte) (n int, src *net.UDPAddr, dst *net.UDPAddr, err error) {
 	n, oobn, _, srcAddr, err := conn.ReadMsgUDP(b, oob)
 	if err != nil {

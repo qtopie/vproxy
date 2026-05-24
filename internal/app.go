@@ -104,8 +104,13 @@ func (a *App) RunWrapper(args []string) {
 
 	bestURL, _ := url.Parse(best)
 
+	var ebpfResult *ebpf.LoadResult
 	cleanup := func() {
-		if needsEbpf && runtime.GOOS == "linux" {
+		if ebpfResult != nil {
+			ebpfResult.Unload()
+			ebpfResult = nil
+		} else if needsEbpf && runtime.GOOS == "linux" {
+			// iptables fallback: clean up rules on exit.
 			iptables.CleanupRules()
 		}
 		ph.Stop()
@@ -164,23 +169,42 @@ func (a *App) RunWrapper(args []string) {
 			log.Fatalf("Fatal: failed to move to cgroup: %v", err)
 		}
 
-		// Enable SO_MARK on vproxy's own connections to bypass iptables
+		// Enable SO_MARK on vproxy's own connections to bypass the redirect rules.
 		ebpf.SetEnabled(true)
 		SetDialerControl(ebpf.GetDialerControl())
 
-		// Setup iptables rules for the cgroup
+		// Attempt eBPF-native redirect (kernel >= 5.7).
+		// On failure, fall back to iptables automatically.
+		var setupTarget string
 		if isUpstreamTProxyAlive {
-			Debugf("Upstream provides tproxy directly and is ALIVE: %s, forwarding directly without starting local transparent proxy", bestURL.Host)
-			if err := iptables.SetupRules(bestURL.Host); err != nil {
-				log.Fatalf("Fatal: iptables setup failed: %v", err)
-			}
+			setupTarget = bestURL.Host
 		} else {
 			if err := ph.StartTransparent(); err != nil {
 				log.Fatalf("Failed to start transparent bridge: %v", err)
 			}
-			if err := iptables.SetupRules(fmt.Sprintf("%d", ph.TransPort)); err != nil {
+			setupTarget = fmt.Sprintf("%d", ph.TransPort)
+		}
+
+		const cgroupPath = "/sys/fs/cgroup/vproxy"
+		proxyPort := uint16(ph.TransPort)
+		const bypassMark = uint32(0xff)
+
+		if ebpf.IsKernelSupported() {
+			r, err := ebpf.Load(cgroupPath, proxyPort, bypassMark)
+			if err != nil {
+				Debugf("eBPF load failed (%v), falling back to iptables", err)
+			} else {
+				ebpfResult = r
+				Debugf("eBPF redirect active (IPv4/IPv6 TCP+UDP)")
+			}
+		}
+
+		if ebpfResult == nil {
+			// iptables fallback.
+			if err := iptables.SetupRules(setupTarget); err != nil {
 				log.Fatalf("Fatal: iptables setup failed: %v", err)
 			}
+			Debugf("iptables redirect active (IPv4 TCP+UDP only)")
 		}
 
 		// Ensure cleanup on unexpected signals
