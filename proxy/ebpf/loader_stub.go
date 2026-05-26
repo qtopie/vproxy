@@ -22,7 +22,7 @@ type LoadResult struct {
 func IsKernelSupported() bool { return false }
 
 // Load always returns an error on non-Linux platforms.
-func Load(_ string, _ uint16, _ uint32) (*LoadResult, error) {
+func Load(_ string, _ uint16, _ uint32, _ bool, _ net.IP, _ uint16) (*LoadResult, error) {
 	return nil, fmt.Errorf("eBPF not supported on this platform")
 }
 
@@ -30,7 +30,7 @@ func Load(_ string, _ uint16, _ uint32) (*LoadResult, error) {
 func (r *LoadResult) Unload() error { return nil }
 
 // UpdateConfig is a no-op on non-Linux platforms.
-func (r *LoadResult) UpdateConfig(_ uint16, _ uint32, _ bool) error { return nil }
+func (r *LoadResult) UpdateConfig(_ uint16, _ uint32, _ bool, _ bool, _ net.IP, _ uint16) error { return nil }
 
 // CIDRManager stub.
 type CIDRManager struct{}

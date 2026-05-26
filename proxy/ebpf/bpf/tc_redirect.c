@@ -123,7 +123,7 @@ int tc_ingress(struct __sk_buff *skb) {
     skb->mark = proxy_mark;
 
     if (verbose_mode) {
-        bpf_printk("[vproxy] marked packet (mark=%x), passing to stack", proxy_mark);
+        // bpf_printk("[vproxy] marked packet (mark=%x), passing to stack", proxy_mark);
     }
 
     // 返回 TC_ACT_OK 表示“数据包有效，继续传递给内核网络栈”

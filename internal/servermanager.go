@@ -2,6 +2,8 @@ package internal
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/url"
@@ -151,8 +153,10 @@ func (sm *ServerManager) testServers() {
 
 	for _, addr := range servers {
 		dialAddr := addr
+		scheme := ""
 		if u, err := url.Parse(addr); err == nil && u.Host != "" {
 			dialAddr = u.Host
+			scheme = u.Scheme
 			if !strings.Contains(dialAddr, ":") {
 				switch u.Scheme {
 				case "http":
@@ -173,9 +177,28 @@ func (sm *ServerManager) testServers() {
 		}
 		conn, err := dialer.DialContext(context.Background(), "tcp", dialAddr)
 		if err == nil {
+			// If it's a SOCKS5 server, do a simple handshake to ensure it's actually a proxy
+			// and not just a random open port (like our own vproxy bridge which hasn't finished starting)
+			if scheme == "socks5" {
+				conn.SetDeadline(time.Now().Add(sm.testTimeout))
+				// SOCKS5 handshake: [0x05, 0x01, 0x00] (Version 5, 1 method, No Auth)
+				_, err = conn.Write([]byte{0x05, 0x01, 0x00})
+				if err == nil {
+					resp := make([]byte, 2)
+					_, err = io.ReadFull(conn, resp)
+					if err == nil && resp[0] == 0x05 {
+						// Success!
+					} else {
+						err = fmt.Errorf("invalid SOCKS5 response")
+					}
+				}
+			}
+
 			conn.Close()
-			foundAddr = addr
-			break
+			if err == nil {
+				foundAddr = addr
+				break
+			}
 		}
 	}
 

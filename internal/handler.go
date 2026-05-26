@@ -35,6 +35,12 @@ type ProxyHandler struct {
 	transLn     net.Listener
 	transUDPLn  *net.UDPConn
 	udpSessions sync.Map
+	ebpfResult  *ebpf.LoadResult
+}
+
+// SetEbpfResult sets the eBPF load result containing maps for orig dst lookup.
+func (ph *ProxyHandler) SetEbpfResult(r *ebpf.LoadResult) {
+	ph.ebpfResult = r
 }
 
 // NewProxyHandler constructs a ProxyHandler. Exported to allow callers in other packages
@@ -139,16 +145,17 @@ func (ph *ProxyHandler) StartTransparent() error {
 		return nil
 	}
 
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", ph.TransPort))
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", ph.TransPort))
 	if err != nil {
-		log.Printf("Transparent proxy port %d is already in use, binding to a free port instead...", ph.TransPort)
-		ln, err = net.Listen("tcp", "127.0.0.1:0")
+		Infof("Transparent proxy port %d is already in use, binding to a free port instead...", ph.TransPort)
+		ln, err = net.Listen("tcp", ":0")
 		if err != nil {
 			return err
 		}
 	}
 	ph.transLn = ln
 	ph.TransPort = ln.Addr().(*net.TCPAddr).Port
+	Infof("Transparent TCP proxy listening on %d (mode: redirect)", ph.TransPort)
 	go ph.serveTransparent()
 
 	udpLn, err := tproxy.ListenUDPTransparent(ph.TransPort)
@@ -229,9 +236,26 @@ func (ph *ProxyHandler) serveTransparent() {
 		}
 		go func(conn net.Conn) {
 			defer conn.Close()
-			target, err := tproxy.GetOriginalDst(conn)
+			var target string
+			var err error
+			if ph.ebpfResult != nil && ph.ebpfResult.TCPOrigDst != nil {
+				if origAddr, errLookup := ebpf.LookupTCPOrigDst(ph.ebpfResult.TCPOrigDst, conn); errLookup == nil {
+					target = origAddr.String()
+					Debugf("[Transparent] Resolved original DST from eBPF map: %s", target)
+				} else {
+					target, err = tproxy.GetOriginalDst(conn)
+					if err == nil {
+						Debugf("[Transparent] Resolved original DST from SO_ORIGINAL_DST: %s", target)
+					}
+				}
+			} else {
+				target, err = tproxy.GetOriginalDst(conn)
+				if err == nil {
+					Debugf("[Transparent] Resolved original DST from SO_ORIGINAL_DST: %s", target)
+				}
+			}
 			if err != nil {
-				log.Printf("Failed to get original destination: %v", err)
+				log.Printf("[Transparent] Failed to get original destination from %s: %v", conn.RemoteAddr(), err)
 				return
 			}
 			ph.forward(conn, target)
@@ -246,6 +270,11 @@ func (ph *ProxyHandler) serveTransparentUDP() {
 		n, src, dst, err := tproxy.ReadFromUDPWithOrigDst(ph.transUDPLn, buf, oob)
 		if err != nil {
 			return
+		}
+		if ph.ebpfResult != nil && ph.ebpfResult.UDPOrigDst != nil {
+			if origDst, errLookup := ebpf.LookupUDPOrigDst(ph.ebpfResult.UDPOrigDst, src); errLookup == nil {
+				dst = origDst
+			}
 		}
 		if dst == nil {
 			continue // ignore packets without orig dst
@@ -497,7 +526,9 @@ func (ph *ProxyHandler) dialTargetTLS(target string, process string) (*tls.Conn,
 func (ph *ProxyHandler) dialTarget(target string, process string) (net.Conn, error) {
 	host, portStr, _ := net.SplitHostPort(target)
 	port, _ := strconv.Atoi(portStr)
-	if ph.rm.MatchContext(MatchContext{Host: host, Port: port, Process: process}) == ActionDirect {
+	action := ph.rm.MatchContext(MatchContext{Host: host, Port: port, Process: process})
+	if action == ActionDirect {
+		Debugf("[Dial] Target %s matches DIRECT rule, dialing directly", target)
 		return dialDirect(target)
 	}
 
@@ -506,9 +537,12 @@ func (ph *ProxyHandler) dialTarget(target string, process string) (net.Conn, err
 		servers := ph.sm.GetServers()
 		if len(servers) > 0 {
 			upstreamURL = servers[0]
+			Debugf("[Dial] No verified upstream, falling back to first configured: %s", upstreamURL)
 		} else {
 			return nil, fmt.Errorf("no upstream servers configured")
 		}
+	} else {
+		Debugf("[Dial] Routing %s through upstream: %s", target, upstreamURL)
 	}
 
 	u, err := url.Parse(upstreamURL)
@@ -594,6 +628,11 @@ func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 		TraceInfof(ctx, "Accepted connection from %s targeting %s", conn.RemoteAddr(), target)
 	}
 
+	if target == conn.LocalAddr().String() {
+		TraceErrorf(ctx, "Loop detected: target is the same as local address %s, dropping connection", target)
+		return
+	}
+
 	rc, err := ph.dialTarget(target, process)
 	if err != nil {
 		TraceErrorf(ctx, "Failed to connect to target %s: %v", target, err)
@@ -620,8 +659,11 @@ func dialHTTP(proxyAddr, target string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	
+	// Create a buffered reader to read the response headers
+	br := bufio.NewReader(conn)
 	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target)
-	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodConnect})
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -630,7 +672,10 @@ func dialHTTP(proxyAddr, target string) (net.Conn, error) {
 		conn.Close()
 		return nil, fmt.Errorf("HTTP proxy error: %s", resp.Status)
 	}
-	return conn, nil
+	
+	// Return a wrapped connection that includes any data already read into the buffer
+	Debugf("[Dial] Established HTTP CONNECT tunnel to %s via %s (buffered: %d bytes)", target, proxyAddr, br.Buffered())
+	return &peekedConn{Reader: br, Conn: conn}, nil
 }
 
 func dialDirect(target string) (net.Conn, error) {

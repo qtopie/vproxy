@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 )
 
@@ -15,25 +16,20 @@ func Relay(ctx context.Context, left, right net.Conn) error {
 	var errLeft, errRight error
 	wg.Add(2)
 
-	closer := func() {
-		_ = left.Close()
-		_ = right.Close()
-	}
-
 	go func() {
 		defer wg.Done()
-		defer closer()
 		var n int64
 		n, errLeft = io.Copy(right, left)
-		TraceDebugf(ctx, ">>> TUN -> SOCKS: copied %d bytes, err: %v", n, errLeft)
+		TraceDebugf(ctx, ">>> L -> R: copied %d bytes, err: %v", n, errLeft)
+		_ = right.Close() // Notify the other side we are done writing
 	}()
 
 	go func() {
 		defer wg.Done()
-		defer closer()
 		var n int64
 		n, errRight = io.Copy(left, right)
-		TraceDebugf(ctx, "<<< SOCKS -> TUN: copied %d bytes, err: %v", n, errRight)
+		TraceDebugf(ctx, "<<< R -> L: copied %d bytes, err: %v", n, errRight)
+		_ = left.Close() // Notify the other side we are done writing
 	}()
 
 	wg.Wait()
@@ -53,6 +49,10 @@ func isIgnorableError(err error) bool {
 		return true
 	}
 	if errors.Is(err, io.EOF) {
+		return true
+	}
+	// "use of closed network connection" is expected when one side closes and the other is still reading/writing
+	if strings.Contains(err.Error(), "use of closed network connection") {
 		return true
 	}
 	if ne, ok := err.(net.Error); ok && ne.Timeout() {

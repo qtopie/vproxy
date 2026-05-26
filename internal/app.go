@@ -10,7 +10,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"syscall"
 	"time"
 
@@ -27,32 +26,88 @@ type App struct {
 	LocalSocks int
 	LocalHTTP  int
 	LocalTrans int
+	
+	ebpfResult *ebpf.LoadResult // Strong reference to prevent GC of eBPF FDs
 }
 
 func (a *App) RunServer() {
 	sm, ph := a.setupServices()
 	sm.Start()
 	if err := ph.StartSocks(); err != nil {
-		log.Fatalf("Failed to start SOCKS5 proxy: %v", err)
+		msg := fmt.Sprintf("Failed to start SOCKS5 proxy: %v", err)
+		fmt.Fprintln(os.Stderr, msg)
+		log.Fatal(msg)
 	}
 	if err := ph.StartHTTP(); err != nil {
-		log.Fatalf("Failed to start HTTP proxy: %v", err)
+		msg := fmt.Sprintf("Failed to start HTTP proxy: %v", err)
+		fmt.Fprintln(os.Stderr, msg)
+		log.Fatal(msg)
 	}
 
 	best := sm.GetBestServer()
 	isUpstreamTProxyAlive := false
+	var bestURL *url.URL
 	if best != "" {
-		if u, err := url.Parse(best); err == nil && u.Scheme == "tproxy" {
+		bestURL, _ = url.Parse(best)
+		if bestURL != nil && bestURL.Scheme == "tproxy" {
 			isUpstreamTProxyAlive = true
 		}
 	}
 
 	if !isUpstreamTProxyAlive {
 		if err := ph.StartTransparent(); err != nil {
-			log.Fatalf("Failed to start transparent proxy: %v", err)
+			msg := fmt.Sprintf("Failed to start transparent proxy: %v", err)
+			fmt.Fprintln(os.Stderr, msg)
+			log.Fatal(msg)
 		}
 	} else {
 		Debugf("Upstream provides tproxy directly and is ALIVE: %s, not starting local transparent proxy in server mode", best)
+	}
+
+	// On Linux, if transparent proxy is enabled, we need to setup the global redirection rules
+	if a.Config.EnableEbpf != nil && *a.Config.EnableEbpf && runtime.GOOS == "linux" {
+		Infof("Setting up system-wide transparent proxying rules (using config: %s)...", a.ConfigPath)
+		
+		setupTarget := fmt.Sprintf("%d", ph.TransPort)
+		if isUpstreamTProxyAlive {
+			setupTarget = bestURL.Host
+		}
+
+		isRemoteTProxy := false
+		var upstreamIP net.IP
+		var upstreamPort uint16
+		if isUpstreamTProxyAlive {
+			isRemoteTProxy = true
+			host, portStr, err := net.SplitHostPort(bestURL.Host)
+			if err == nil {
+				upstreamIP = net.ParseIP(host)
+				var p int
+				fmt.Sscanf(portStr, "%d", &p)
+				upstreamPort = uint16(p)
+			}
+		}
+
+		const cgroupPath = "/sys/fs/cgroup/vproxy"
+		if ebpf.IsKernelSupported() && os.Getenv("VP_FORCE_IPTABLES") != "1" {
+			r, err := ebpf.Load(cgroupPath, uint16(ph.TransPort), 0xff, isRemoteTProxy, upstreamIP, upstreamPort)
+			if err == nil {
+				a.ebpfResult = r
+				ph.SetEbpfResult(r)
+				Infof("eBPF redirect active (system-wide)")
+			} else {
+				Errorf("eBPF load failed: %v, falling back to iptables", err)
+			}
+		}
+		if a.ebpfResult == nil {
+			if err := iptables.SetupRules(setupTarget, isRemoteTProxy, upstreamIP, upstreamPort); err != nil {
+				Errorf("Failed to setup system-wide iptables rules: %v", err)
+			} else {
+				Infof("iptables redirect active (system-wide)")
+			}
+		}
+		
+		ebpf.SetEnabled(true)
+		SetDialerControl(ebpf.GetDialerControl())
 	}
 
 	a.PrintConnectivityOK()
@@ -65,6 +120,12 @@ func (a *App) RunServer() {
 	<-sigCh
 
 	Debugf("Shutting down...")
+	if a.ebpfResult != nil {
+		a.ebpfResult.Unload()
+	} else if a.Config.EnableEbpf != nil && *a.Config.EnableEbpf && runtime.GOOS == "linux" {
+		iptables.CleanupRules()
+	}
+
 	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
 		tproxy.Cleanup()
 	}
@@ -73,12 +134,14 @@ func (a *App) RunServer() {
 }
 
 func (a *App) RunWrapper(args []string) {
+	cmdName := args[0]
+	cmdArgs := args[1:]
 	Debugf("running command %v", args)
 
-	baseName := filepath.Base(args[0])
+	baseName := filepath.Base(cmdName)
 	needsEbpf := true
 	switch baseName {
-	case "curl", "git", "code", "gemini", "antigravity":
+	case "curl", "git", "code", "gemini", "test_ebpf", "test_tproxy":
 		needsEbpf = false
 	}
 
@@ -129,62 +192,47 @@ func (a *App) RunWrapper(args []string) {
 	skipPrivileged := false
 	if _, err := os.Stat("/tmp/vproxy.pid"); err == nil {
 		skipPrivileged = true
-		Debugf("Background vproxy detected, skipping privileged transparent proxy setup")
+		Debugf("Background vproxy detected, skipping privileged server setup")
+	}
+
+	// Always attempt cgroup migration on Linux if transparent proxying is REQUIRED
+	if needsEbpf && a.Config.EnableEbpf != nil && *a.Config.EnableEbpf && runtime.GOOS == "linux" {
+		if err := cgroup.MoveProcessToVProxyCgroup(os.Getpid()); err != nil {
+			Debugf("Process migration to cgroup failed: %v", err)
+			if !skipPrivileged {
+				msg := "vproxy process migration failed! Please initialize the environment by running: 'sudo vproxy init'"
+				fmt.Fprintln(os.Stderr, msg)
+				log.Fatal(msg)
+			} else {
+				// Even if skipPrivileged is true, if this is a mandatory eBPF tool like agy, 
+				// failing to move to cgroup means it won't be intercepted.
+				msg := fmt.Sprintf("CRITICAL: Failed to move %s to vproxy cgroup: %v. Transparent proxying will NOT work.", cmdName, err)
+				fmt.Fprintln(os.Stderr, msg)
+				Debugf(msg)
+			}
+		} else {
+			Debugf("Successfully moved process %d (%s) to vproxy cgroup for transparent interception", os.Getpid(), cmdName)
+		}
+		
+		// If we're on Linux, we also need to ensure SO_MARK is set for our own bridges
+		ebpf.SetEnabled(true)
+		SetDialerControl(ebpf.GetDialerControl())
 	}
 
 	if !skipPrivileged && a.Config.EnableEbpf != nil && *a.Config.EnableEbpf && runtime.GOOS == "linux" && needsEbpf {
 		// Check if we have permissions to set SO_MARK (requires CAP_NET_ADMIN)
 		if err := ebpf.CheckPermission(); err != nil {
-			if os.Getenv("VP_FIX_ATTEMPTED") == "1" {
-				log.Fatalf("Fatal: permission setup failed even after attempting fixes: %v", err)
-			}
-
-			fmt.Println("\n" + strings.Repeat("=", 60))
-			fmt.Printf(" [!] CAPABILITIES REQUIRED\n")
-			fmt.Printf(" Transparent proxying requires CAP_NET_ADMIN to set SO_MARK.\n")
-			fmt.Printf(" Would you like to run 'sudo setcap' and setup cgroups? [y/N]: ")
-			
-			var confirm string
-			fmt.Scanln(&confirm)
-			fmt.Println(strings.Repeat("=", 60))
-
-			if confirm == "y" || confirm == "Y" {
-				exe, _ := os.Executable()
-				user := os.Getenv("USER")
-				if user == "" { user = "root" }
-				
-				fixCmd := fmt.Sprintf(
-					"sudo setcap cap_net_admin,cap_net_bind_service,cap_bpf,cap_sys_resource+ep %s && " +
-					"sudo mkdir -p /sys/fs/cgroup/vproxy && " +
-					"sudo chown -R %s /sys/fs/cgroup/vproxy",
-					exe, user,
-				)
-				
-				fmt.Printf("\n[+] Configuring Permissions...\n")
-				exec.Command("bash", "-c", fixCmd).Run()
-
-				fmt.Printf("[+] Permissions updated. Restarting vproxy...\n\n")
-				env := os.Environ()
-				env = append(env, "VP_FIX_ATTEMPTED=1")
-				if err := syscall.Exec(exe, os.Args, env); err != nil {
-					log.Fatalf("Failed to restart: %v", err)
-				}
-			} else {
-				log.Fatalf("Fatal: permission check failed: %v", err)
-			}
+			msg := "vproxy permission check failed! Please initialize the environment by running: 'sudo vproxy init'"
+			fmt.Fprintln(os.Stderr, msg)
+			log.Fatal(msg)
 		}
 
-		// Ensure cgroup exists and move current process into it
+		// Ensure cgroup exists (already moved to it above, but ensure directory exists)
 		if err := cgroup.EnsureVProxyCgroup(); err != nil {
-			log.Fatalf("Fatal: failed to setup cgroup: %v", err)
+			msg := "vproxy permission check failed! Please initialize the environment by running: 'sudo vproxy init'"
+			fmt.Fprintln(os.Stderr, msg)
+			log.Fatal(msg)
 		}
-		if err := cgroup.MoveProcessToVProxyCgroup(os.Getpid()); err != nil {
-			log.Fatalf("Fatal: failed to move to cgroup: %v", err)
-		}
-
-		// Enable SO_MARK on vproxy's own connections to bypass the redirect rules.
-		ebpf.SetEnabled(true)
-		SetDialerControl(ebpf.GetDialerControl())
 
 		// Attempt eBPF-native redirect (kernel >= 5.7).
 		// On failure, fall back to iptables automatically.
@@ -193,7 +241,9 @@ func (a *App) RunWrapper(args []string) {
 			setupTarget = bestURL.Host
 		} else {
 			if err := ph.StartTransparent(); err != nil {
-				log.Fatalf("Failed to start transparent bridge: %v", err)
+				msg := fmt.Sprintf("Failed to start transparent bridge: %v", err)
+				fmt.Fprintln(os.Stderr, msg)
+				log.Fatal(msg)
 			}
 			setupTarget = fmt.Sprintf("%d", ph.TransPort)
 		}
@@ -202,20 +252,39 @@ func (a *App) RunWrapper(args []string) {
 		proxyPort := uint16(ph.TransPort)
 		const bypassMark = uint32(0xff)
 
-		if ebpf.IsKernelSupported() {
-			r, err := ebpf.Load(cgroupPath, proxyPort, bypassMark)
+		isRemoteTProxy := false
+		var upstreamIP net.IP
+		var upstreamPort uint16
+
+		if isUpstreamTProxyAlive {
+			isRemoteTProxy = true
+			host, portStr, err := net.SplitHostPort(bestURL.Host)
+			if err == nil {
+				upstreamIP = net.ParseIP(host)
+				var p int
+				if _, err := fmt.Sscanf(portStr, "%d", &p); err == nil {
+					upstreamPort = uint16(p)
+				}
+			}
+		}
+
+		if ebpf.IsKernelSupported() && os.Getenv("VP_FORCE_IPTABLES") != "1" {
+			r, err := ebpf.Load(cgroupPath, proxyPort, bypassMark, isRemoteTProxy, upstreamIP, upstreamPort)
 			if err != nil {
 				Debugf("eBPF load failed (%v), falling back to iptables", err)
 			} else {
 				ebpfResult = r
+				ph.SetEbpfResult(r)
 				Debugf("eBPF redirect active (IPv4/IPv6 TCP+UDP)")
 			}
 		}
 
 		if ebpfResult == nil {
 			// iptables fallback.
-			if err := iptables.SetupRules(setupTarget); err != nil {
-				log.Fatalf("Fatal: iptables setup failed: %v", err)
+			if err := iptables.SetupRules(setupTarget, isRemoteTProxy, upstreamIP, upstreamPort); err != nil {
+				msg := fmt.Sprintf("Fatal: iptables setup failed: %v", err)
+				fmt.Fprintln(os.Stderr, msg)
+				log.Fatal(msg)
 			}
 			Debugf("iptables redirect active (IPv4 TCP+UDP only)")
 		}
@@ -229,22 +298,24 @@ func (a *App) RunWrapper(args []string) {
 			os.Exit(1)
 		}()
 	}
-	cmdName := args[0]
-	cmdArgs := args[1:]
 	env := os.Environ()
 	if IsVerbose() {
 		if err := mitm.EnsureCA(); err == nil {
-			env = append(env, fmt.Sprintf("SSL_CERT_FILE=%s", mitm.GetCACertPath()))
-			Debugf("Tracing CA injected into environment: SSL_CERT_FILE=%s", mitm.GetCACertPath())
+			caPath := mitm.GetCACertPath()
+			env = append(env, fmt.Sprintf("SSL_CERT_FILE=%s", caPath))
+			// Node.js specific CA support
+			env = append(env, fmt.Sprintf("NODE_EXTRA_CA_CERTS=%s", caPath))
+			Debugf("Tracing CA injected into environment: SSL_CERT_FILE=%s, NODE_EXTRA_CA_CERTS=%s", caPath, caPath)
 		} else {
 			Errorf("Failed to initialize dynamic CA: %v", err)
 		}
 	}
 
-	// If background vproxy is running, we don't need to set environment variables
-	// because TUN will intercept the traffic directly.
-	if skipPrivileged {
-		Debugf("Background vproxy detected, executing %s directly (letting TUN handle it)", cmdName)
+	// If background vproxy is running and this tool needs transparent proxying, 
+	// we don't need to set environment variables because TUN/iptables will intercept it.
+	// For tools that use env-vars (needsEbpf=false), we always proceed to set them.
+	if skipPrivileged && needsEbpf {
+		Debugf("Background vproxy detected, executing %s directly (intercepted by system-wide rules)", cmdName)
 		cmd := exec.Command(cmdName, cmdArgs...)
 		cmd.Env = env
 		cmd.Stdout = os.Stdout
@@ -281,7 +352,9 @@ func (a *App) RunWrapper(args []string) {
 		Debugf("Protocol match: using upstream HTTP proxy directly for %s", cmdName)
 	} else {
 		if err := ph.StartHTTP(); err != nil {
-			log.Fatalf("Failed to start local HTTP bridge: %v", err)
+			msg := fmt.Sprintf("Failed to start local HTTP bridge: %v", err)
+			fmt.Fprintln(os.Stderr, msg)
+			log.Fatal(msg)
 		}
 		finalHTTPProxy = fmt.Sprintf("http://127.0.0.1:%d", ph.HttpPort)
 		Debugf("Protocol mismatch (upstream is %s): started local HTTP bridge at %s", bestURL.Scheme, finalHTTPProxy)
@@ -294,7 +367,9 @@ func (a *App) RunWrapper(args []string) {
 			Debugf("Protocol match: using upstream SOCKS5 proxy directly")
 		} else {
 			if err := ph.StartSocks(); err != nil {
-				log.Fatalf("Failed to start local SOCKS5 bridge: %v", err)
+				msg := fmt.Sprintf("Failed to start local SOCKS5 bridge: %v", err)
+				fmt.Fprintln(os.Stderr, msg)
+				log.Fatal(msg)
 			}
 			finalSocksProxy = fmt.Sprintf("socks5://127.0.0.1:%d", ph.SocksPort)
 			Debugf("Protocol mismatch (upstream is %s): started local SOCKS5 bridge at %s", bestURL.Scheme, finalSocksProxy)
@@ -314,13 +389,15 @@ func (a *App) RunWrapper(args []string) {
 		env = a.appendNoProxyEnv(env)
 		newArgs = cmdArgs
 	default:
-		env = append(env, fmt.Sprintf("http_proxy=%s", finalHTTPProxy))
-		env = append(env, fmt.Sprintf("https_proxy=%s", finalHTTPProxy))
-		env = append(env, fmt.Sprintf("all_proxy=%s", finalSocksProxy))
-		env = append(env, fmt.Sprintf("HTTP_PROXY=%s", finalHTTPProxy))
-		env = append(env, fmt.Sprintf("HTTPS_PROXY=%s", finalHTTPProxy))
-		env = append(env, fmt.Sprintf("ALL_PROXY=%s", finalSocksProxy))
-		env = a.appendNoProxyEnv(env)
+		if !needsEbpf {
+			env = append(env, fmt.Sprintf("http_proxy=%s", finalHTTPProxy))
+			env = append(env, fmt.Sprintf("https_proxy=%s", finalHTTPProxy))
+			env = append(env, fmt.Sprintf("all_proxy=%s", finalSocksProxy))
+			env = append(env, fmt.Sprintf("HTTP_PROXY=%s", finalHTTPProxy))
+			env = append(env, fmt.Sprintf("HTTPS_PROXY=%s", finalHTTPProxy))
+			env = append(env, fmt.Sprintf("ALL_PROXY=%s", finalSocksProxy))
+			env = a.appendNoProxyEnv(env)
+		}
 		newArgs = cmdArgs
 	}
 

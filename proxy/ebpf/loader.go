@@ -13,6 +13,7 @@ import (
 
 	ciliumebpf "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/rlimit"
 	"golang.org/x/sys/unix"
 )
 
@@ -35,30 +36,22 @@ type LoadResult struct {
 // BPF_PROG_TYPE_CGROUP_SOCK_ADDR with connect4/sendmsg4/connect6/sendmsg6.
 // This requires kernel >= 5.7 for the full set of hooks.
 func IsKernelSupported() bool {
-	var u unix.Utsname
-	if err := unix.Uname(&u); err != nil {
-		return false
+	if runtime.GOOS == "linux" {
+		return true
 	}
-	// int8 array on some arches — convert to string safely
-	var buf [65]byte
-	for i, c := range u.Release {
-		if c == 0 {
-			break
-		}
-		buf[i] = byte(c)
-	}
-	release := string(buf[:])
-	var major, minor int
-	fmt.Sscanf(release, "%d.%d", &major, &minor)
-	return major > 5 || (major == 5 && minor >= 7)
+	return false
 }
 
 // Load compiles and attaches all BPF cgroup programs to cgroupPath,
 // then initialises the config_map and writes default CIDR bypass entries.
 // On error the caller should fall back to iptables.
-func Load(cgroupPath string, proxyPort uint16, bypassMark uint32) (*LoadResult, error) {
+func Load(cgroupPath string, proxyPort uint16, bypassMark uint32, isRemoteTProxy bool, upstreamIP net.IP, upstreamPort uint16) (*LoadResult, error) {
 	if runtime.GOARCH == "wasm" {
 		return nil, fmt.Errorf("eBPF not supported on wasm")
+	}
+
+	if err := rlimit.RemoveMemlock(); err != nil {
+		return nil, fmt.Errorf("removing memlock: %w", err)
 	}
 
 	spec, err := loadBpf()
@@ -80,7 +73,7 @@ func Load(cgroupPath string, proxyPort uint16, bypassMark uint32) (*LoadResult, 
 	defer cgroupFD.Close()
 	cgFD := int(cgroupFD.Fd())
 
-	// Attach all four cgroup hooks.
+	// Attach all cgroup hooks including TCP sockops
 	programs := []struct {
 		prog    *ciliumebpf.Program
 		attach  ciliumebpf.AttachType
@@ -90,6 +83,7 @@ func Load(cgroupPath string, proxyPort uint16, bypassMark uint32) (*LoadResult, 
 		{objs.Sock4Sendmsg, ciliumebpf.AttachCGroupUDP4Sendmsg, "sendmsg4"},
 		{objs.Sock6Connect, ciliumebpf.AttachCGroupInet6Connect, "connect6"},
 		{objs.Sock6Sendmsg, ciliumebpf.AttachCGroupUDP6Sendmsg, "sendmsg6"},
+		{objs.VproxySockops, ciliumebpf.AttachCGroupSockOps, "sockops"},
 	}
 
 	var links []link.Link
@@ -121,7 +115,7 @@ func Load(cgroupPath string, proxyPort uint16, bypassMark uint32) (*LoadResult, 
 	}
 
 	// Write runtime configuration.
-	if err := r.writeConfig(proxyPort, bypassMark, false); err != nil {
+	if err := r.writeConfig(proxyPort, bypassMark, false, isRemoteTProxy, upstreamIP, upstreamPort); err != nil {
 		r.Unload()
 		return nil, fmt.Errorf("writing config_map: %w", err)
 	}
@@ -136,12 +130,12 @@ func Load(cgroupPath string, proxyPort uint16, bypassMark uint32) (*LoadResult, 
 	return r, nil
 }
 
-// UpdateConfig hot-updates proxy_port and bypass_mark without reloading BPF.
-func (r *LoadResult) UpdateConfig(proxyPort uint16, bypassMark uint32, verbose bool) error {
-	return r.writeConfig(proxyPort, bypassMark, verbose)
+// UpdateConfig hot-updates proxy config without reloading BPF.
+func (r *LoadResult) UpdateConfig(proxyPort uint16, bypassMark uint32, verbose bool, isRemoteTProxy bool, upstreamIP net.IP, upstreamPort uint16) error {
+	return r.writeConfig(proxyPort, bypassMark, verbose, isRemoteTProxy, upstreamIP, upstreamPort)
 }
 
-func (r *LoadResult) writeConfig(proxyPort uint16, bypassMark uint32, verbose bool) error {
+func (r *LoadResult) writeConfig(proxyPort uint16, bypassMark uint32, verbose bool, isRemoteTProxy bool, upstreamIP net.IP, upstreamPort uint16) error {
 	set := func(idx uint32, val uint64) error {
 		return r.ConfigMap.Put(idx, val)
 	}
@@ -155,7 +149,46 @@ func (r *LoadResult) writeConfig(proxyPort uint16, bypassMark uint32, verbose bo
 	if verbose {
 		v = 1
 	}
-	return set(cfgVerbose, v)
+	if err := set(cfgVerbose, v); err != nil {
+		return err
+	}
+
+	// Remote TProxy status
+	remoteVal := uint64(0)
+	if isRemoteTProxy {
+		remoteVal = 1
+	}
+	if err := set(cfgIsRemoteTProxy, remoteVal); err != nil {
+		return err
+	}
+
+	// Upstream IP and Port
+	upPort := uint64(upstreamPort)
+	if err := set(cfgUpstreamPort, upPort); err != nil {
+		return err
+	}
+
+	var ip4Val uint32
+	var ip6Val0, ip6Val1 uint64
+	if upstreamIP != nil {
+		if ip4 := upstreamIP.To4(); ip4 != nil {
+			ip4Val = binary.BigEndian.Uint32(ip4) // network byte order
+		} else if ip6 := upstreamIP.To16(); ip6 != nil {
+			ip6Val0 = uint64(binary.BigEndian.Uint32(ip6[0:4]))<<32 | uint64(binary.BigEndian.Uint32(ip6[4:8]))
+			ip6Val1 = uint64(binary.BigEndian.Uint32(ip6[8:12]))<<32 | uint64(binary.BigEndian.Uint32(ip6[12:16]))
+		}
+	}
+	if err := set(cfgUpstreamIP4, uint64(ip4Val)); err != nil {
+		return err
+	}
+	if err := set(cfgUpstreamIP6_0, ip6Val0); err != nil {
+		return err
+	}
+	if err := set(cfgUpstreamIP6_1, ip6Val1); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // Unload detaches all BPF programs and closes all map FDs.
@@ -175,12 +208,15 @@ func (r *LoadResult) Unload() error {
 
 // config_map indices (must match redirect.c).
 const (
-	cfgProxyPort  uint32 = 0
-	cfgBypassMark uint32 = 1
-	cfgVerbose    uint32 = 2
+	cfgProxyPort        uint32 = 0
+	cfgBypassMark       uint32 = 1
+	cfgVerbose          uint32 = 2
+	cfgIsRemoteTProxy   uint32 = 3
+	cfgUpstreamIP4      uint32 = 4
+	cfgUpstreamPort     uint32 = 5
+	cfgUpstreamIP6_0    uint32 = 6
+	cfgUpstreamIP6_1    uint32 = 7
 )
-
-// ── Map key/value types matching the C structs ────────────────────────────────
 
 // UDPOrigKey mirrors struct udp_orig_key in redirect.c.
 // src_port is in HOST byte order (matching bpf_sock.src_port).
@@ -188,6 +224,16 @@ type UDPOrigKey struct {
 	SrcPort uint16
 	Family  uint8
 	Pad     uint8
+}
+
+// TCP4TupleKey mirrors struct tcp_4tuple_key in redirect.c.
+type TCP4TupleKey struct {
+	ClientIP   [16]byte
+	ProxyIP    [16]byte
+	ClientPort uint16
+	ProxyPort  uint16
+	Family     uint8
+	Pad        [3]byte
 }
 
 // LPMCIDRKey mirrors struct lpm_cidr_key in redirect.c.
@@ -199,7 +245,7 @@ type LPMCIDRKey struct {
 
 // OriginalDst mirrors struct original_dst in redirect.c.
 type OriginalDst struct {
-	IP     [4]uint32 // IPv4: IP[0] in network byte order; IPv6: all 4 words
+	IP     [16]byte  // IPv4: IP[0-3] in network byte order; IPv6: all 16 bytes
 	Port   uint32    // network byte order
 	Family uint32    // AF_INET or AF_INET6
 }
@@ -208,7 +254,7 @@ type OriginalDst struct {
 func (d *OriginalDst) ToTCPAddr() *net.TCPAddr {
 	return &net.TCPAddr{
 		IP:   d.toNetIP(),
-		Port: int(ntohs(uint16(d.Port))),
+		Port: int(binary.BigEndian.Uint16((*[2]byte)(unsafe.Pointer(&d.Port))[:])),
 	}
 }
 
@@ -216,67 +262,55 @@ func (d *OriginalDst) ToTCPAddr() *net.TCPAddr {
 func (d *OriginalDst) ToUDPAddr() *net.UDPAddr {
 	return &net.UDPAddr{
 		IP:   d.toNetIP(),
-		Port: int(ntohs(uint16(d.Port))),
+		Port: int(binary.BigEndian.Uint16((*[2]byte)(unsafe.Pointer(&d.Port))[:])),
 	}
 }
 
 func (d *OriginalDst) toNetIP() net.IP {
 	if d.Family == unix.AF_INET6 {
-		b := make([]byte, 16)
-		binary.BigEndian.PutUint32(b[0:4], d.IP[0])
-		binary.BigEndian.PutUint32(b[4:8], d.IP[1])
-		binary.BigEndian.PutUint32(b[8:12], d.IP[2])
-		binary.BigEndian.PutUint32(b[12:16], d.IP[3])
-		return net.IP(b)
+		ip := make(net.IP, 16)
+		copy(ip, d.IP[:])
+		return ip
 	}
-	// AF_INET: IP[0] is in network byte order
-	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, d.IP[0])
-	return net.IP(b)
+	// AF_INET: IP[0-3] is in network byte order
+	return net.IP(d.IP[:4])
 }
 
 // ── TCP lookup/delete ─────────────────────────────────────────────────────────
 
 // LookupTCPOrigDst retrieves the original destination for a TCP connection
-// identified by its socket cookie. Deletes the entry on success to prevent leaks.
+// identified by its 4-tuple. Deletes the entry on success to prevent leaks.
 func LookupTCPOrigDst(m *ciliumebpf.Map, conn net.Conn) (*net.TCPAddr, error) {
-	cookie, err := getSockCookie(conn)
-	if err != nil {
-		return nil, fmt.Errorf("getting socket cookie: %w", err)
+	localAddr, okLocal := conn.LocalAddr().(*net.TCPAddr)
+	remoteAddr, okRemote := conn.RemoteAddr().(*net.TCPAddr)
+	if !okLocal || !okRemote {
+		return nil, fmt.Errorf("not a *net.TCPAddr")
 	}
+
+	var key TCP4TupleKey
+	family := uint8(unix.AF_INET)
+	if localAddr.IP.To4() == nil {
+		family = unix.AF_INET6
+	}
+	key.Family = family
+
+	if family == unix.AF_INET {
+		copy(key.ClientIP[:4], remoteAddr.IP.To4())
+		copy(key.ProxyIP[:4], localAddr.IP.To4())
+	} else {
+		copy(key.ClientIP[:], remoteAddr.IP.To16())
+		copy(key.ProxyIP[:], localAddr.IP.To16())
+	}
+
+	key.ClientPort = uint16(remoteAddr.Port)
+	key.ProxyPort = uint16(localAddr.Port)
 
 	var dst OriginalDst
-	if err := m.LookupAndDelete(cookie, &dst); err != nil {
-		return nil, fmt.Errorf("tcp_orig_dst lookup (cookie=%d): %w", cookie, err)
+	if err := m.LookupAndDelete(key, &dst); err != nil {
+		return nil, fmt.Errorf("tcp_orig_dst lookup (sport=%d dport=%d): %w",
+			key.ClientPort, key.ProxyPort, err)
 	}
 	return dst.ToTCPAddr(), nil
-}
-
-// getSockCookie returns the SO_COOKIE value of conn (which must be a *net.TCPConn).
-func getSockCookie(conn net.Conn) (uint64, error) {
-	tcpConn, ok := conn.(*net.TCPConn)
-	if !ok {
-		return 0, fmt.Errorf("not a *net.TCPConn")
-	}
-	raw, err := tcpConn.SyscallConn()
-	if err != nil {
-		return 0, err
-	}
-	var cookie uint64
-	var sockErr error
-	_ = raw.Control(func(fd uintptr) {
-		// SO_COOKIE = 57
-		v, e := unix.GetsockoptUint64(int(fd), unix.SOL_SOCKET, unix.SO_COOKIE)
-		if e != nil {
-			sockErr = e
-			return
-		}
-		cookie = v
-	})
-	if sockErr != nil {
-		return 0, sockErr
-	}
-	return cookie, nil
 }
 
 // ── UDP lookup/delete ─────────────────────────────────────────────────────────
@@ -382,7 +416,7 @@ func parseCIDRKey(cidr string) (LPMCIDRKey, error) {
 	ones, _ := ipNet.Mask.Size()
 	return LPMCIDRKey{
 		Prefixlen: uint32(ones),
-		Addr:      binary.BigEndian.Uint32(v4), // host byte order
+		Addr:      binary.LittleEndian.Uint32(v4), // memory layout must match BPF LPM_TRIE bytes
 	}, nil
 }
 

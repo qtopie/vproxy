@@ -118,7 +118,7 @@ func NewRuleManager(ruleEntries []string) *RuleManager {
 			continue
 		}
 
-		if strings.ToUpper(pattern) == "DEFAULT" {
+		if strings.ToUpper(pattern) == "DEFAULT" || strings.ToUpper(pattern) == "FINAL" {
 			rm.defaultAction = action
 			continue
 		}

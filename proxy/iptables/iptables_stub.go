@@ -3,7 +3,9 @@
 
 package iptables
 
-func SetupRules(target string) error {
+import "net"
+
+func SetupRules(target string, isRemoteTProxy bool, upstreamIP net.IP, upstreamPort uint16) error {
 	return nil
 }
 

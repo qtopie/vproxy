@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -22,6 +23,10 @@ var (
 	localHTTP  = flag.Int("http", 8118, "local HTTP proxy port")
 	localSocks = flag.Int("socks", 1080, "local SOCKS5 proxy port")
 	localTrans = flag.Int("trans", 10080, "local transparent proxy port")
+)
+
+var (
+	pidFile = filepath.Join(os.TempDir(), "vproxy.pid")
 )
 
 func main() {
@@ -45,6 +50,22 @@ func main() {
 		if os.Geteuid() != 0 {
 			log.Fatal("'init' command requires sudo privileges")
 		}
+		
+		binary, err := os.Executable()
+		if err == nil {
+			sudoUser := os.Getenv("SUDO_USER")
+			if sudoUser == "" {
+				sudoUser = "root"
+			}
+			
+			fmt.Printf("vproxy: Setting up BPF capabilities for binary %s\n", binary)
+			exec.Command("setcap", "cap_net_admin,cap_net_bind_service,cap_bpf,cap_sys_resource,cap_dac_override+ep", binary).Run()
+			
+			fmt.Println("vproxy: Setting up cgroups directory /sys/fs/cgroup/vproxy")
+			exec.Command("mkdir", "-p", "/sys/fs/cgroup/vproxy").Run()
+			exec.Command("chown", "-R", sudoUser, "/sys/fs/cgroup/vproxy").Run()
+		}
+
 		startBackgroundServer(*configPath)
 		return
 	}
@@ -57,15 +78,18 @@ func main() {
 	isVerbose := (verbose != nil && *verbose) || os.Getenv("VP_VERBOSE") == "1"
 	if isVerbose {
 		vlink.SetVerbose(true)
+		vlink.Debugf("Verbose mode enabled (VP_VERBOSE=1 or -v)")
 	}
 
 	// Redirect logs to a file to keep console clean for the wrapped command
-	logPath := fmt.Sprintf("/tmp/vproxy-%d.log", os.Getpid())
+	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("vproxy-%d.log", os.Getpid()))
 	if len(args) > 0 {
 		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err == nil {
 			vlink.SetOutput(f)
 			fmt.Fprintf(os.Stderr, "vproxy: logging to %s\n", logPath)
+		} else {
+			fmt.Fprintf(os.Stderr, "vproxy: failed to open log file %s: %v\n", logPath, err)
 		}
 	}
 
@@ -76,17 +100,17 @@ func main() {
 		LocalHTTP:  *localHTTP,
 		LocalTrans: *localTrans,
 	}
+	vlink.Debugf("vproxy app initialized with config: %s", finalPath)
 
 	if len(args) > 0 {
 		// If it's a command like 'vproxy agy'
 		cmdName := args[0]
+		vlink.Debugf("Target command: %s", cmdName)
 		
 		// 1. Ensure the command is in our PROCESS proxy list
 		ensureProcessInConfig(finalPath, cfg, cmdName)
 		
 		// 2. Run the command. 
-		// If a background vproxy is already running TUN, we don't need to wrap it with env vars,
-		// but we do it anyway as a fallback.
 		vproxy.RunWrapper(args)
 		return
 	}
@@ -94,8 +118,6 @@ func main() {
 	// Default: Run as foreground server
 	vproxy.RunServer()
 }
-
-const pidFile = "/tmp/vproxy.pid"
 
 func startBackgroundServer(config string) {
 	// Check if already running
@@ -109,8 +131,8 @@ func startBackgroundServer(config string) {
 	// Inherit environment but set a marker
 	cmd.Env = append(os.Environ(), "VP_BACKGROUND=1")
 	
-	// Open log file for background process in the local directory so it can be inspected
-	logFile := "vproxy.log"
+	// Open log file for background process in the system temp directory so it can be inspected
+	logFile := filepath.Join(os.TempDir(), "vproxy.log")
 	f, _ := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	cmd.Stdout = f
 	cmd.Stderr = f
