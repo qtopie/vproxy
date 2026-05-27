@@ -204,5 +204,10 @@ func isPrivateIP(ip net.IP) bool {
 			(ip4[0] == 172 && (ip4[1] >= 16 && ip4[1] <= 31)) ||
 			(ip4[0] == 192 && ip4[1] == 168)
 	}
+	if ip6 := ip.To16(); ip6 != nil {
+		// IPv6 Unique Local Address (ULA) fc00::/7
+		// fc00::/7 spans fc00:: to fdff::
+		return (ip6[0] & 0xfe) == 0xfc
+	}
 	return false
 }

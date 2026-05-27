@@ -39,9 +39,13 @@ func ListenUDPTransparent(port int) (*net.UDPConn, error) {
 			return opErr
 		},
 	}
-	conn, err := lc.ListenPacket(context.Background(), "udp", fmt.Sprintf("0.0.0.0:%d", port))
+	conn, err := lc.ListenPacket(context.Background(), "udp", fmt.Sprintf("[::]:%d", port))
 	if err != nil {
-		return nil, err
+		// Fallback to 0.0.0.0 if IPv6 is disabled in the environment
+		conn, err = lc.ListenPacket(context.Background(), "udp", fmt.Sprintf("0.0.0.0:%d", port))
+		if err != nil {
+			return nil, err
+		}
 	}
 	return conn.(*net.UDPConn), nil
 }
@@ -99,7 +103,13 @@ func DialUDPTransparent(origDst *net.UDPAddr) (*net.UDPConn, error) {
 			return opErr
 		},
 	}
-	conn, err := lc.ListenPacket(context.Background(), "udp", origDst.String())
+	network := "udp"
+	if origDst.IP.To4() == nil {
+		network = "udp6"
+	} else {
+		network = "udp4"
+	}
+	conn, err := lc.ListenPacket(context.Background(), network, origDst.String())
 	if err != nil {
 		return nil, err
 	}

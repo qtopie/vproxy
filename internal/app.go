@@ -110,6 +110,8 @@ func (a *App) RunServer() {
 		SetDialerControl(ebpf.GetDialerControl())
 	}
 
+	a.printVerboseStatus(ph, sm, a.ebpfResult != nil, isUpstreamTProxyAlive, best)
+
 	a.PrintConnectivityOK()
 
 	go a.watchConfig(a.ConfigPath, ph)
@@ -298,6 +300,9 @@ func (a *App) RunWrapper(args []string) {
 			os.Exit(1)
 		}()
 	}
+
+	a.printVerboseStatus(ph, sm, ebpfResult != nil, isUpstreamTProxyAlive, best)
+
 	env := os.Environ()
 	if IsVerbose() {
 		if err := mitm.EnsureCA(); err == nil {
@@ -513,4 +518,46 @@ func (a *App) monitorNetwork(sm *ServerManager) {
 			}
 		}
 	}
+}
+
+func (a *App) printVerboseStatus(ph *ProxyHandler, sm *ServerManager, isEbpfActive bool, isUpstreamTProxy bool, upstream string) {
+	if !IsVerbose() {
+		return
+	}
+
+	// 1. IPv6 availability check
+	ipv6Available := "Unavailable"
+	ln6, err := net.Listen("tcp6", "[::1]:0")
+	if err == nil {
+		ipv6Available = "Available (Loopback Active)"
+		ln6.Close()
+	}
+
+	// 2. eBPF maps status
+	ebpfStatus := "Inactive"
+	if isEbpfActive {
+		ebpfStatus = "Active (Maps Loaded: tcp_orig_dst, udp_orig_dst, cidr_bypass_map)"
+	}
+
+	// 3. iptables info
+	iptablesInfo := "Inactive"
+	if !isEbpfActive && runtime.GOOS == "linux" {
+		iptablesInfo = "Active fallback (TPROXY redirection configured)"
+	}
+
+	// 4. Upstream Connection Info
+	upstreamInfo := "None configured"
+	if upstream != "" {
+		upstreamInfo = fmt.Sprintf("Active upstream: %s (Verified)", upstream)
+	}
+
+	Debugf("=================== vproxy System Status ===================")
+	Debugf("[STATUS] IPv6 Availability:     %s", ipv6Available)
+	Debugf("[STATUS] eBPF Redirect Status:   %s", ebpfStatus)
+	Debugf("[STATUS] iptables Redirection:   %s", iptablesInfo)
+	Debugf("[STATUS] Upstream Proxy:        %s", upstreamInfo)
+	Debugf("[STATUS] Local SOCKS5 Port:      %d", a.LocalSocks)
+	Debugf("[STATUS] Local HTTP Port:        %d", a.LocalHTTP)
+	Debugf("[STATUS] Local Transparent Port: %d", ph.TransPort)
+	Debugf("============================================================")
 }

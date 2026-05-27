@@ -223,7 +223,32 @@ func (ph *ProxyHandler) serveSocks() {
 			if err != nil {
 				return
 			}
-			ph.forward(conn, tgt.String())
+
+			traceID := fmt.Sprintf("conn-%04d", atomic.AddUint64(&traceCounter, 1))
+			ctx := context.WithValue(context.Background(), traceKey{}, traceID)
+			ctx = context.WithValue(ctx, startTimeKey{}, time.Now())
+			TraceInfof(ctx, "[SOCKS5] Accepted connection from %s targeting %s", conn.RemoteAddr(), tgt.String())
+
+			rc, err := ph.dialTarget(tgt.String(), "")
+			if err != nil {
+				TraceErrorf(ctx, "[SOCKS5] Failed to connect to target %s: %v", tgt.String(), err)
+				socks.WriteReply(conn, socks.ErrConnectionRefused, nil)
+				return
+			}
+			defer rc.Close()
+
+			if err := socks.WriteReply(conn, socks.Error(0), nil); err != nil {
+				TraceErrorf(ctx, "[SOCKS5] Failed to write handshake reply: %v", err)
+				return
+			}
+
+			TraceInfof(ctx, "[SOCKS5] Successfully established tunnel to target %s", tgt.String())
+			err = Relay(ctx, rc, conn)
+			if err != nil {
+				TraceErrorf(ctx, "[SOCKS5] Tunnel closed with error: %v", err)
+			} else {
+				TraceInfof(ctx, "[SOCKS5] Tunnel closed cleanly")
+			}
 		}(conn)
 	}
 }

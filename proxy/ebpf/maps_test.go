@@ -19,11 +19,11 @@ func TestParseCIDRKey_Valid(t *testing.T) {
 		wantPrefixlen  uint32
 		wantAddrHost   uint32 // host byte order
 	}{
-		{"127.0.0.0/8", 8, 0x7F000000},
-		{"10.0.0.0/8", 8, 0x0A000000},
-		{"172.16.0.0/12", 12, 0xAC100000},
-		{"192.168.0.0/16", 16, 0xC0A80000},
-		{"169.254.0.0/16", 16, 0xA9FE0000},
+		{"127.0.0.0/8", 8, 0x0000007F},
+		{"10.0.0.0/8", 8, 0x0000000A},
+		{"172.16.0.0/12", 12, 0x000010AC},
+		{"192.168.0.0/16", 16, 0x0000A8C0},
+		{"169.254.0.0/16", 16, 0x0000FEA9},
 		{"0.0.0.0/0", 0, 0x00000000},
 		{"8.8.8.8/32", 32, 0x08080808},
 	}
@@ -61,9 +61,8 @@ func TestParseCIDRKey_Invalid(t *testing.T) {
 
 func TestOriginalDst_IPv4_ToTCPAddr(t *testing.T) {
 	// Represent 1.2.3.4:8080
-	// IP[0] in network byte order: 0x01020304
 	dst := OriginalDst{
-		IP:     [4]uint32{0x01020304, 0, 0, 0},
+		IP:     [16]byte{1, 2, 3, 4},
 		Port:   uint32(htons(8080)),
 		Family: unix.AF_INET,
 	}
@@ -80,15 +79,13 @@ func TestOriginalDst_IPv4_ToTCPAddr(t *testing.T) {
 func TestOriginalDst_IPv6_ToUDPAddr(t *testing.T) {
 	// Represent [2001:db8::1]:53
 	// 2001:0db8:0000:0000:0000:0000:0000:0001
+	var ipBytes [16]byte
+	copy(ipBytes[:], net.ParseIP("2001:db8::1").To16())
 	dst := OriginalDst{
+		IP:     ipBytes,
 		Family: unix.AF_INET6,
 		Port:   uint32(htons(53)),
 	}
-	// Pack the IPv6 address as big-endian uint32 words
-	dst.IP[0] = 0x20010db8 // 2001:0db8
-	dst.IP[1] = 0x00000000 // ::
-	dst.IP[2] = 0x00000000 // ::
-	dst.IP[3] = 0x00000001 // ::1
 
 	addr := dst.ToUDPAddr()
 	if addr.Port != 53 {
