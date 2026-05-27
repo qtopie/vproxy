@@ -20,7 +20,7 @@ type AttachResponse struct {
 
 // RequestAttach sends an attach request to the background vproxy daemon.
 func RequestAttach(pid int) error {
-	conn, err := net.DialTimeout("unix", SocketPath, 2*time.Second)
+	conn, err := net.DialTimeout("unix", SocketPath, 100*time.Millisecond)
 	if err != nil {
 		return fmt.Errorf("failed to connect to vproxy daemon (is it running?): %v", err)
 	}
@@ -32,7 +32,7 @@ func RequestAttach(pid int) error {
 	}
 
 	var resp AttachResponse
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
 		return fmt.Errorf("failed to read attach response: %v", err)
 	}
