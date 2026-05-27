@@ -58,6 +58,12 @@ func main() {
 		if os.Geteuid() != 0 {
 			log.Fatal("'init' command requires sudo privileges")
 		}
+
+		// Fail fast: verify configuration exists and is valid before starting daemon
+		_, resolvedPath, err := vlink.LoadConfig(*configPath)
+		if err != nil {
+			log.Fatalf("init failed: %v", err)
+		}
 		
 		binary, err := os.Executable()
 		if err == nil {
@@ -74,7 +80,7 @@ func main() {
 			exec.Command("chown", "-R", sudoUser, "/sys/fs/cgroup/vproxy").Run()
 		}
 
-		startBackgroundServer(*configPath)
+		startBackgroundServer(resolvedPath)
 		return
 	}
 
