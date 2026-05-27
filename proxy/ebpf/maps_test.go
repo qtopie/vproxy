@@ -37,8 +37,9 @@ func TestParseCIDRKey_Valid(t *testing.T) {
 			if key.Prefixlen != tt.wantPrefixlen {
 				t.Errorf("Prefixlen: got %d, want %d", key.Prefixlen, tt.wantPrefixlen)
 			}
-			if key.Addr != tt.wantAddrHost {
-				t.Errorf("Addr: got 0x%08X, want 0x%08X", key.Addr, tt.wantAddrHost)
+			gotAddr := binary.LittleEndian.Uint32(key.Addr[:])
+			if gotAddr != tt.wantAddrHost {
+				t.Errorf("Addr: got 0x%08X, want 0x%08X", gotAddr, tt.wantAddrHost)
 			}
 		})
 	}

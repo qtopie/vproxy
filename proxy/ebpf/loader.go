@@ -237,10 +237,9 @@ type TCP4TupleKey struct {
 }
 
 // LPMCIDRKey mirrors struct lpm_cidr_key in redirect.c.
-// Addr is in HOST byte order.
 type LPMCIDRKey struct {
 	Prefixlen uint32
-	Addr      uint32
+	Addr      [4]byte
 }
 
 // OriginalDst mirrors struct original_dst in redirect.c.
@@ -390,17 +389,15 @@ func (c *CIDRManager) Remove(cidr string) error {
 // List returns all currently installed bypass CIDRs.
 func (c *CIDRManager) List() ([]string, error) {
 	var results []string
-	var key, nextKey LPMCIDRKey
+	var key LPMCIDRKey
 	var val uint8
 
 	iter := c.m.Iterate()
 	for iter.Next(&key, &val) {
 		ones := key.Prefixlen
-		addr := make(net.IP, 4)
-		binary.BigEndian.PutUint32(addr, key.Addr)
+		addr := net.IP(key.Addr[:])
 		results = append(results, fmt.Sprintf("%s/%d", addr.String(), ones))
 	}
-	_ = nextKey
 	return results, iter.Err()
 }
 
@@ -414,10 +411,10 @@ func parseCIDRKey(cidr string) (LPMCIDRKey, error) {
 		return LPMCIDRKey{}, fmt.Errorf("only IPv4 CIDRs supported in cidr_bypass_map: %s", cidr)
 	}
 	ones, _ := ipNet.Mask.Size()
-	return LPMCIDRKey{
-		Prefixlen: uint32(ones),
-		Addr:      binary.LittleEndian.Uint32(v4), // memory layout must match BPF LPM_TRIE bytes
-	}, nil
+	var key LPMCIDRKey
+	key.Prefixlen = uint32(ones)
+	copy(key.Addr[:], v4)
+	return key, nil
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────

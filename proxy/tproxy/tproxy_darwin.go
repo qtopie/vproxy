@@ -42,6 +42,12 @@ func GetOriginalDst(conn net.Conn) (string, error) {
 	return "", fmt.Errorf("not a gvisor connection")
 }
 
+// IsTUNConn checks if the connection originated from the TUN/GVisor stack.
+func IsTUNConn(conn net.Conn) bool {
+	_, ok := conn.(*gonet.TCPConn)
+	return ok
+}
+
 func GetOriginalDstEBPF(conn net.Conn, m TCPOrigDstMap) (string, error) {
 	return "", fmt.Errorf("EBPF not supported on macOS")
 }

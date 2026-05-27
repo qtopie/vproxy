@@ -40,6 +40,7 @@ func main() {
 	// 1. Validate Interception Mode on Linux if transparent
 	if runtime.GOOS == "linux" && testMode == "transparent" && testIntercept != "" {
 		forceIptables := os.Getenv("VP_FORCE_IPTABLES") == "1"
+		useTun := os.Getenv("VP_USE_TUN") == "1"
 		if testIntercept == "iptables" {
 			if !forceIptables {
 				fmt.Println("\033[1;31m❌ Verification Failed: Expected 'iptables' mode, but VP_FORCE_IPTABLES is not set to '1'!\033[0m")
@@ -47,11 +48,17 @@ func main() {
 			}
 			fmt.Println("    - \033[1;32m✓ Verified: Interception correctly forced to iptables (VP_FORCE_IPTABLES=1)\033[0m")
 		} else if testIntercept == "ebpf" {
-			if forceIptables {
-				fmt.Println("\033[1;31m❌ Verification Failed: Expected 'ebpf' mode, but VP_FORCE_IPTABLES is set to '1'!\033[0m")
+			if forceIptables || useTun {
+				fmt.Println("\033[1;31m❌ Verification Failed: Expected 'ebpf' mode, but VP_FORCE_IPTABLES or VP_USE_TUN is active!\033[0m")
 				os.Exit(1)
 			}
-			fmt.Println("    - \033[1;32m✓ Verified: Interception mode defaults to eBPF (VP_FORCE_IPTABLES is off)\033[0m")
+			fmt.Println("    - \033[1;32m✓ Verified: Interception mode defaults to eBPF (VP_FORCE_IPTABLES is off, VP_USE_TUN is off)\033[0m")
+		} else if testIntercept == "tun" {
+			if !useTun {
+				fmt.Println("\033[1;31m❌ Verification Failed: Expected 'tun' mode, but VP_USE_TUN is not set to '1'!\033[0m")
+				os.Exit(1)
+			}
+			fmt.Println("    - \033[1;32m✓ Verified: Interception correctly forced to TUN (VP_USE_TUN=1)\033[0m")
 		}
 	}
 

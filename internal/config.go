@@ -11,8 +11,10 @@ type Config struct {
 	Upstreams    []string `json:"upstreams"`
 	Rules        []string `json:"rules"`
 	TestInterval int      `json:"test_interval"` // seconds
-	EnableEbpf   *bool    `json:"enable_ebpf,omitempty"`
-	DirectDNS    *bool    `json:"direct_dns,omitempty"`
+	EnableEbpf     *bool    `json:"enable_ebpf,omitempty"`
+	DirectDNS      *bool    `json:"direct_dns,omitempty"`
+	DialTimeoutMs  *int     `json:"dial_timeout_ms,omitempty"`
+	DialRetryCount *int     `json:"dial_retry_count,omitempty"`
 }
 
 // LoadConfig loads the configuration from the given path, with fallbacks to global and local defaults.
@@ -70,6 +72,14 @@ func LoadConfig(path string) (*Config, string, error) {
 	if cfg.DirectDNS == nil {
 		trueVal := true
 		cfg.DirectDNS = &trueVal
+	}
+	if cfg.DialTimeoutMs == nil {
+		fiveSec := 5000
+		cfg.DialTimeoutMs = &fiveSec
+	}
+	if cfg.DialRetryCount == nil {
+		threeAttempts := 3
+		cfg.DialRetryCount = &threeAttempts
 	}
 
 	return &cfg, finalPath, nil

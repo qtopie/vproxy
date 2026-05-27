@@ -52,11 +52,11 @@ struct tcp_4tuple_key {
 
 /*
  * Key for the LPM-TRIE CIDR bypass map.
- * addr is in HOST byte order so that LPM prefix matching is straightforward.
+ * addr is in NETWORK byte order (matched bit-by-bit from index 0).
  */
 struct lpm_cidr_key {
 	__u32 prefixlen;
-	__u32 addr; /* host byte order */
+	__u8  addr[4];
 };
 
 /* ── Maps ────────────────────────────────────────────────────── */
@@ -211,8 +211,8 @@ static __always_inline int is_bypass_socket(struct bpf_sock_addr *ctx) {
 static __always_inline int is_cidr_bypass_v4(__u32 addr_net) {
 	struct lpm_cidr_key k = {
 		.prefixlen = 32,
-		.addr      = bpf_ntohl(addr_net), /* convert to host byte order for LPM bit match */
 	};
+	*(__u32 *)k.addr = addr_net;
 	return bpf_map_lookup_elem(&cidr_bypass_map, &k) != NULL;
 }
 
@@ -279,7 +279,7 @@ int sock4_connect(struct bpf_sock_addr *ctx) {
         if (is_bypass_socket(ctx))
                 return 1;
         /* Explicitly bypass loopback and DNS */
-        if ((ctx->user_ip4 & 0x000000FFU) == 0x0000007FU) /* 127.x.x.x in network order */
+        if ((ctx->user_ip4 & bpf_htonl(0xFF000000)) == bpf_htonl(0x7F000000))
                 return 1;
         if (ctx->user_port == bpf_htons(53))
                 return 1;
@@ -323,7 +323,7 @@ int sock4_sendmsg(struct bpf_sock_addr *ctx) {
         if (is_bypass_socket(ctx))
                 return 1;
         /* Explicitly bypass loopback and DNS */
-        if ((ctx->user_ip4 & 0x000000FFU) == 0x0000007FU)
+        if ((ctx->user_ip4 & bpf_htonl(0xFF000000)) == bpf_htonl(0x7F000000))
                 return 1;
         if (ctx->user_port == bpf_htons(53))
                 return 1;

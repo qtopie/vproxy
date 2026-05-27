@@ -65,7 +65,7 @@ func (a *App) RunServer() {
 	}
 
 	// On Linux, if transparent proxy is enabled, we need to setup the global redirection rules
-	if a.Config.EnableEbpf != nil && *a.Config.EnableEbpf && runtime.GOOS == "linux" {
+	if a.Config.EnableEbpf != nil && *a.Config.EnableEbpf && runtime.GOOS == "linux" && os.Getenv("VP_USE_TUN") != "1" {
 		Infof("Setting up system-wide transparent proxying rules (using config: %s)...", a.ConfigPath)
 		
 		setupTarget := fmt.Sprintf("%d", ph.TransPort)
@@ -141,10 +141,17 @@ func (a *App) RunWrapper(args []string) {
 	Debugf("running command %v", args)
 
 	baseName := filepath.Base(cmdName)
+	isTUN := os.Getenv("VP_USE_TUN") == "1"
 	needsEbpf := true
-	switch baseName {
-	case "curl", "git", "code", "gemini", "test_ebpf", "test_tproxy":
+	needsTransparent := true
+	if isTUN {
 		needsEbpf = false
+	} else {
+		switch baseName {
+		case "curl", "git", "code", "gemini", "test_ebpf", "test_tproxy":
+			needsEbpf = false
+			needsTransparent = false
+		}
 	}
 
 	sm, ph := a.setupServices()
@@ -197,19 +204,18 @@ func (a *App) RunWrapper(args []string) {
 		Debugf("Background vproxy detected, skipping privileged server setup")
 	}
 
-	// Always attempt cgroup migration on Linux if transparent proxying is REQUIRED
-	if needsEbpf && a.Config.EnableEbpf != nil && *a.Config.EnableEbpf && runtime.GOOS == "linux" {
+	// Always attempt cgroup migration on Linux if transparent proxying is POSSIBLE (either via this wrapper or background server)
+	if (needsEbpf || skipPrivileged) && a.Config.EnableEbpf != nil && *a.Config.EnableEbpf && runtime.GOOS == "linux" {
 		if err := cgroup.MoveProcessToVProxyCgroup(os.Getpid()); err != nil {
 			Debugf("Process migration to cgroup failed: %v", err)
-			if !skipPrivileged {
+			if !skipPrivileged && needsEbpf {
 				msg := "vproxy process migration failed! Please initialize the environment by running: 'sudo vproxy init'"
 				fmt.Fprintln(os.Stderr, msg)
 				log.Fatal(msg)
 			} else {
-				// Even if skipPrivileged is true, if this is a mandatory eBPF tool like agy, 
-				// failing to move to cgroup means it won't be intercepted.
-				msg := fmt.Sprintf("CRITICAL: Failed to move %s to vproxy cgroup: %v. Transparent proxying will NOT work.", cmdName, err)
-				fmt.Fprintln(os.Stderr, msg)
+				// If we failed to move to cgroup, it's not always fatal if skipPrivileged is true (maybe already there)
+				// but for tests it might be an issue.
+				msg := fmt.Sprintf("WARNING: Failed to move %s to vproxy cgroup: %v. Transparent proxying might NOT work.", cmdName, err)
 				Debugf(msg)
 			}
 		} else {
@@ -221,16 +227,16 @@ func (a *App) RunWrapper(args []string) {
 		SetDialerControl(ebpf.GetDialerControl())
 	}
 
-	if !skipPrivileged && a.Config.EnableEbpf != nil && *a.Config.EnableEbpf && runtime.GOOS == "linux" && needsEbpf {
+	if !skipPrivileged && (isTUN || (a.Config.EnableEbpf != nil && *a.Config.EnableEbpf)) && runtime.GOOS == "linux" && needsTransparent {
 		// Check if we have permissions to set SO_MARK (requires CAP_NET_ADMIN)
-		if err := ebpf.CheckPermission(); err != nil {
+		if err := ebpf.CheckPermission(); err != nil && !isTUN {
 			msg := "vproxy permission check failed! Please initialize the environment by running: 'sudo vproxy init'"
 			fmt.Fprintln(os.Stderr, msg)
 			log.Fatal(msg)
 		}
 
 		// Ensure cgroup exists (already moved to it above, but ensure directory exists)
-		if err := cgroup.EnsureVProxyCgroup(); err != nil {
+		if err := cgroup.EnsureVProxyCgroup(); err != nil && !isTUN {
 			msg := "vproxy permission check failed! Please initialize the environment by running: 'sudo vproxy init'"
 			fmt.Fprintln(os.Stderr, msg)
 			log.Fatal(msg)
@@ -245,60 +251,59 @@ func (a *App) RunWrapper(args []string) {
 			if err := ph.StartTransparent(); err != nil {
 				msg := fmt.Sprintf("Failed to start transparent bridge: %v", err)
 				fmt.Fprintln(os.Stderr, msg)
-				log.Fatal(msg)
 			}
-			setupTarget = fmt.Sprintf("%d", ph.TransPort)
+			setupTarget = fmt.Sprintf("127.0.0.1:%d", ph.TransPort)
 		}
 
-		const cgroupPath = "/sys/fs/cgroup/vproxy"
-		proxyPort := uint16(ph.TransPort)
-		const bypassMark = uint32(0xff)
+		if needsEbpf {
+			const cgroupPath = "/sys/fs/cgroup/vproxy"
+			proxyPort := uint16(ph.TransPort)
+			const bypassMark = uint32(0xff)
 
-		isRemoteTProxy := false
-		var upstreamIP net.IP
-		var upstreamPort uint16
+			isRemoteTProxy := false
+			var upstreamIP net.IP
+			var upstreamPort uint16
 
-		if isUpstreamTProxyAlive {
-			isRemoteTProxy = true
-			host, portStr, err := net.SplitHostPort(bestURL.Host)
-			if err == nil {
-				upstreamIP = net.ParseIP(host)
-				var p int
-				if _, err := fmt.Sscanf(portStr, "%d", &p); err == nil {
-					upstreamPort = uint16(p)
+			if isRemoteTProxy {
+				if host, portStr, err := net.SplitHostPort(setupTarget); err == nil {
+					upstreamIP = net.ParseIP(host)
+					var p int
+					if _, err := fmt.Sscanf(portStr, "%d", &p); err == nil {
+						upstreamPort = uint16(p)
+					}
 				}
 			}
-		}
 
-		if ebpf.IsKernelSupported() && os.Getenv("VP_FORCE_IPTABLES") != "1" {
-			r, err := ebpf.Load(cgroupPath, proxyPort, bypassMark, isRemoteTProxy, upstreamIP, upstreamPort)
-			if err != nil {
-				Debugf("eBPF load failed (%v), falling back to iptables", err)
-			} else {
-				ebpfResult = r
-				ph.SetEbpfResult(r)
-				Debugf("eBPF redirect active (IPv4/IPv6 TCP+UDP)")
+			if ebpf.IsKernelSupported() && os.Getenv("VP_FORCE_IPTABLES") != "1" {
+				r, err := ebpf.Load(cgroupPath, proxyPort, bypassMark, isRemoteTProxy, upstreamIP, upstreamPort)
+				if err != nil {
+					Debugf("eBPF load failed (%v), falling back to iptables", err)
+				} else {
+					ebpfResult = r
+					ph.SetEbpfResult(r)
+					Debugf("eBPF redirect active (wrapper mode)")
+				}
 			}
-		}
 
-		if ebpfResult == nil {
-			// iptables fallback.
-			if err := iptables.SetupRules(setupTarget, isRemoteTProxy, upstreamIP, upstreamPort); err != nil {
-				msg := fmt.Sprintf("Fatal: iptables setup failed: %v", err)
-				fmt.Fprintln(os.Stderr, msg)
-				log.Fatal(msg)
+			if ebpfResult == nil {
+				// iptables fallback.
+				if err := iptables.SetupRules(setupTarget, isRemoteTProxy, upstreamIP, upstreamPort); err != nil {
+					msg := fmt.Sprintf("Fatal: iptables setup failed: %v", err)
+					fmt.Fprintln(os.Stderr, msg)
+					log.Fatal(msg)
+				}
+				Debugf("iptables redirect active (IPv4 TCP+UDP only)")
 			}
-			Debugf("iptables redirect active (IPv4 TCP+UDP only)")
-		}
 
-		// Ensure cleanup on unexpected signals
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		go func() {
-			<-sigCh
-			cleanup()
-			os.Exit(1)
-		}()
+			// Ensure cleanup on unexpected signals
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+			go func() {
+				<-sigCh
+				cleanup()
+				os.Exit(1)
+			}()
+		}
 	}
 
 	a.printVerboseStatus(ph, sm, ebpfResult != nil, isUpstreamTProxyAlive, best)
@@ -465,6 +470,12 @@ func (a *App) setupServices() (*ServerManager, *ProxyHandler) {
 		rm.SetDirectDNS(*a.Config.DirectDNS)
 	}
 	ph := NewProxyHandler(sm, rm, a.LocalSocks, a.LocalHTTP, a.LocalTrans)
+	if a.Config.DialTimeoutMs != nil {
+		ph.DialTimeout = time.Duration(*a.Config.DialTimeoutMs) * time.Millisecond
+	}
+	if a.Config.DialRetryCount != nil {
+		ph.DialRetryCount = *a.Config.DialRetryCount
+	}
 	return sm, ph
 }
 
@@ -537,12 +548,32 @@ func (a *App) printVerboseStatus(ph *ProxyHandler, sm *ServerManager, isEbpfActi
 	ebpfStatus := "Inactive"
 	if isEbpfActive {
 		ebpfStatus = "Active (Maps Loaded: tcp_orig_dst, udp_orig_dst, cidr_bypass_map)"
+	} else if _, err := os.Stat("/tmp/vproxy.pid"); err == nil {
+		if a.Config.EnableEbpf != nil && *a.Config.EnableEbpf {
+			ebpfStatus = "Active (Delegated to system-wide background vproxy server)"
+		} else {
+			ebpfStatus = "Inactive (Delegated to background server, but eBPF is disabled in config)"
+		}
 	}
 
 	// 3. iptables info
 	iptablesInfo := "Inactive"
-	if !isEbpfActive && runtime.GOOS == "linux" {
-		iptablesInfo = "Active fallback (TPROXY redirection configured)"
+	if !isEbpfActive && runtime.GOOS == "linux" && os.Getenv("VP_USE_TUN") != "1" {
+		if _, err := os.Stat("/tmp/vproxy.pid"); err == nil {
+			if a.Config.EnableEbpf != nil && !*a.Config.EnableEbpf {
+				iptablesInfo = "Active (Delegated to system-wide background vproxy server)"
+			} else {
+				iptablesInfo = "Inactive (Using eBPF system-wide instead)"
+			}
+		} else {
+			iptablesInfo = "Active fallback (TPROXY redirection configured)"
+		}
+	}
+
+	// 3b. TUN interface status
+	tunStatus := "Inactive"
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" || (runtime.GOOS == "linux" && os.Getenv("VP_USE_TUN") == "1") {
+		tunStatus = "Active (TUN interface redirection configured)"
 	}
 
 	// 4. Upstream Connection Info
@@ -555,6 +586,7 @@ func (a *App) printVerboseStatus(ph *ProxyHandler, sm *ServerManager, isEbpfActi
 	Debugf("[STATUS] IPv6 Availability:     %s", ipv6Available)
 	Debugf("[STATUS] eBPF Redirect Status:   %s", ebpfStatus)
 	Debugf("[STATUS] iptables Redirection:   %s", iptablesInfo)
+	Debugf("[STATUS] TUN Interface Status:   %s", tunStatus)
 	Debugf("[STATUS] Upstream Proxy:        %s", upstreamInfo)
 	Debugf("[STATUS] Local SOCKS5 Port:      %d", a.LocalSocks)
 	Debugf("[STATUS] Local HTTP Port:        %d", a.LocalHTTP)

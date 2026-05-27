@@ -23,6 +23,7 @@ var (
 	localHTTP  = flag.Int("http", 8118, "local HTTP proxy port")
 	localSocks = flag.Int("socks", 1080, "local SOCKS5 proxy port")
 	localTrans = flag.Int("trans", 10080, "local transparent proxy port")
+	useTun     = flag.Bool("tun", false, "enable TUN mode (Linux only)")
 )
 
 var (
@@ -32,6 +33,13 @@ var (
 func main() {
 	flag.Parse()
 	args := flag.Args()
+
+	if *verbose {
+		vlink.SetVerbose(true)
+	}
+	if *useTun {
+		os.Setenv("VP_USE_TUN", "1")
+	}
 
 	// Handle 'clean' command
 	if len(args) > 0 && args[0] == "clean" {
@@ -127,7 +135,14 @@ func startBackgroundServer(config string) {
 	}
 
 	binary, _ := os.Executable()
-	cmd := exec.Command(binary, "-c", config)
+	bgArgs := []string{"-c", config}
+	if *useTun {
+		bgArgs = append(bgArgs, "-tun")
+	}
+	if *verbose {
+		bgArgs = append(bgArgs, "-v")
+	}
+	cmd := exec.Command(binary, bgArgs...)
 	// Inherit environment but set a marker
 	cmd.Env = append(os.Environ(), "VP_BACKGROUND=1")
 	

@@ -12,6 +12,11 @@ func GetOriginalDst(conn net.Conn) (string, error) {
 	return "", fmt.Errorf("tproxy not supported on this platform")
 }
 
+// IsTUNConn checks if the connection originated from the TUN/GVisor stack.
+func IsTUNConn(conn net.Conn) bool {
+	return false
+}
+
 func GetOriginalDstEBPF(conn net.Conn, m TCPOrigDstMap) (string, error) {
 	return "", fmt.Errorf("tproxy not supported on this platform")
 }

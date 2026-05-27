@@ -7,6 +7,8 @@ import (
 	"os"
 	"sync"
 	"syscall"
+
+	"github.com/qtopie/vproxy/socks"
 )
 
 // Level represents log verbosity levels.
@@ -35,6 +37,7 @@ func SetDialerControl(f func(network, address string, c syscall.RawConn) error) 
 	mu.Lock()
 	defer mu.Unlock()
 	dialerControl = f
+	socks.DefaultDialerControl = f
 }
 
 // GetDialerControl returns a function suitable for net.Dialer.Control.

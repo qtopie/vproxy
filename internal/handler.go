@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"runtime"
 	"strconv"
 	"time"
@@ -25,17 +26,19 @@ import (
 )
 
 type ProxyHandler struct {
-	sm        *ServerManager
-	rm        *RuleManager
-	SocksPort int
-	HttpPort  int
-	TransPort int
-	socksLn     net.Listener
-	httpLn      net.Listener
-	transLn     net.Listener
-	transUDPLn  *net.UDPConn
-	udpSessions sync.Map
-	ebpfResult  *ebpf.LoadResult
+	sm             *ServerManager
+	rm             *RuleManager
+	SocksPort      int
+	HttpPort       int
+	TransPort      int
+	DialTimeout    time.Duration
+	DialRetryCount int
+	socksLn        net.Listener
+	httpLn         net.Listener
+	transLn        net.Listener
+	transUDPLn     *net.UDPConn
+	udpSessions    sync.Map
+	ebpfResult     *ebpf.LoadResult
 }
 
 // SetEbpfResult sets the eBPF load result containing maps for orig dst lookup.
@@ -47,11 +50,13 @@ func (ph *ProxyHandler) SetEbpfResult(r *ebpf.LoadResult) {
 // to create the handler without accessing internal fields directly.
 func NewProxyHandler(sm *ServerManager, rm *RuleManager, socksPort, httpPort, transPort int) *ProxyHandler {
 	return &ProxyHandler{
-		sm:        sm,
-		rm:        rm,
-		SocksPort: socksPort,
-		HttpPort:  httpPort,
-		TransPort: transPort,
+		sm:             sm,
+		rm:             rm,
+		SocksPort:      socksPort,
+		HttpPort:       httpPort,
+		TransPort:      transPort,
+		DialTimeout:    5000 * time.Millisecond, // Default 5 seconds
+		DialRetryCount: 3,                       // Default 3 attempts
 	}
 }
 
@@ -140,6 +145,25 @@ func (ph *ProxyHandler) StartTransparent() error {
 			}, ph.handleUDP)
 			if err != nil {
 				log.Printf("Failed to start Windows transparent proxy: %v", err)
+			}
+		}()
+		return nil
+	}
+
+	if runtime.GOOS == "linux" && os.Getenv("VP_USE_TUN") == "1" {
+		SetDialerControl(tproxy.GetDialerControl())
+		go func() {
+			err := tproxy.StartLinuxTransparent(context.Background(), func(conn net.Conn) {
+				defer conn.Close()
+				target, err := tproxy.GetOriginalDst(conn)
+				if err != nil {
+					log.Printf("Failed to get original destination: %v", err)
+					return
+				}
+				ph.forward(conn, target)
+			}, ph.handleUDP)
+			if err != nil {
+				log.Printf("Failed to start Linux TUN transparent proxy: %v", err)
 			}
 		}()
 		return nil
@@ -554,87 +578,131 @@ func (ph *ProxyHandler) dialTarget(target string, process string) (net.Conn, err
 	action := ph.rm.MatchContext(MatchContext{Host: host, Port: port, Process: process})
 	if action == ActionDirect {
 		Debugf("[Dial] Target %s matches DIRECT rule, dialing directly", target)
-		return dialDirect(target)
+		return ph.dialDirect(target)
 	}
 
-	upstreamURL := ph.sm.GetBestServer()
-	if upstreamURL == "" {
-		servers := ph.sm.GetServers()
-		if len(servers) > 0 {
-			upstreamURL = servers[0]
-			Debugf("[Dial] No verified upstream, falling back to first configured: %s", upstreamURL)
-		} else {
-			return nil, fmt.Errorf("no upstream servers configured")
-		}
-	} else {
-		Debugf("[Dial] Routing %s through upstream: %s", target, upstreamURL)
+	retryCount := ph.DialRetryCount
+	if retryCount <= 0 {
+		retryCount = 3
 	}
-
-	u, err := url.Parse(upstreamURL)
-	if err != nil {
-		return nil, err
+	dialTimeout := ph.DialTimeout
+	if dialTimeout <= 0 {
+		dialTimeout = 5 * time.Second
 	}
 
 	var rc net.Conn
-	switch u.Scheme {
-	case "socks5":
-		rc, err = socks.DialSocks5(u.Host, target)
-	case "http":
-		rc, err = dialHTTP(u.Host, target)
-	default:
-		return nil, fmt.Errorf("unsupported upstream scheme: %s", u.Scheme)
+	var lastErr error
+
+	for attempt := 1; attempt <= retryCount; attempt++ {
+		upstreamURL := ph.sm.GetBestServer()
+		if upstreamURL == "" {
+			servers := ph.sm.GetServers()
+			if len(servers) > 0 {
+				upstreamURL = servers[0]
+				Debugf("[Dial] No verified upstream, falling back to first configured: %s (attempt %d/%d)", upstreamURL, attempt, retryCount)
+			} else {
+				return nil, fmt.Errorf("no upstream servers configured")
+			}
+		} else {
+			Debugf("[Dial] Routing %s through upstream: %s (attempt %d/%d)", target, upstreamURL, attempt, retryCount)
+		}
+
+		u, err := url.Parse(upstreamURL)
+		if err != nil {
+			return nil, err
+		}
+
+		switch u.Scheme {
+		case "socks5":
+			p := socks.NewSocks5Proxy(u.Host, "", "")
+			rc, err = p.DialTCP(context.Background(), target, dialTimeout, GetDialerControl())
+		case "http":
+			rc, err = dialHTTPWithTimeout(u.Host, target, dialTimeout)
+		default:
+			return nil, fmt.Errorf("unsupported upstream scheme: %s", u.Scheme)
+		}
+
+		if err == nil {
+			ph.sm.ReportSuccess(upstreamURL)
+			return rc, nil
+		}
+
+		Debugf("[Dial] Attempt %d/%d to %s failed: %v", attempt, retryCount, upstreamURL, err)
+		ph.sm.ReportFailure(upstreamURL)
+		lastErr = err
+
+		if attempt < retryCount {
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 
-	if err != nil {
-		ph.sm.ReportFailure(upstreamURL)
-		return nil, err
-	}
-	ph.sm.ReportSuccess(upstreamURL)
-	return rc, nil
+	return nil, fmt.Errorf("all TCP dial attempts failed, last error: %w", lastErr)
 }
 
 func (ph *ProxyHandler) dialTargetUDP(target string, process string) (net.Conn, error) {
 	host, portStr, _ := net.SplitHostPort(target)
 	port, _ := strconv.Atoi(portStr)
+	
+	dialTimeout := ph.DialTimeout
+	if dialTimeout <= 0 {
+		dialTimeout = 5 * time.Second
+	}
+	retryCount := ph.DialRetryCount
+	if retryCount <= 0 {
+		retryCount = 3
+	}
+
 	if ph.rm.MatchContext(MatchContext{Host: host, Port: port, Process: process}) == ActionDirect {
 		// Just dial directly for UDP bypassing proxy
 		d := net.Dialer{
-			Timeout: 5 * time.Second,
-			Control: ebpf.GetDialerControl(),
+			Timeout: dialTimeout,
+			Control: GetDialerControl(),
 		}
 		return d.Dial("udp", target)
 	}
 
-	upstreamURL := ph.sm.GetBestServer()
-	if upstreamURL == "" {
-		servers := ph.sm.GetServers()
-		if len(servers) > 0 {
-			upstreamURL = servers[0]
-		} else {
-			return nil, fmt.Errorf("no upstream servers configured")
+	var rc net.Conn
+	var lastErr error
+
+	for attempt := 1; attempt <= retryCount; attempt++ {
+		upstreamURL := ph.sm.GetBestServer()
+		if upstreamURL == "" {
+			servers := ph.sm.GetServers()
+			if len(servers) > 0 {
+				upstreamURL = servers[0]
+			} else {
+				return nil, fmt.Errorf("no upstream servers configured")
+			}
+		}
+
+		u, err := url.Parse(upstreamURL)
+		if err != nil {
+			return nil, err
+		}
+
+		switch u.Scheme {
+		case "socks5":
+			p := socks.NewSocks5Proxy(u.Host, "", "")
+			rc, err = p.DialUDP(context.Background(), target, dialTimeout, GetDialerControl())
+		default:
+			return nil, fmt.Errorf("unsupported upstream scheme for UDP: %s", u.Scheme)
+		}
+
+		if err == nil {
+			ph.sm.ReportSuccess(upstreamURL)
+			return rc, nil
+		}
+
+		Debugf("[Dial UDP] Attempt %d/%d to %s failed: %v", attempt, retryCount, upstreamURL, err)
+		ph.sm.ReportFailure(upstreamURL)
+		lastErr = err
+
+		if attempt < retryCount {
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 
-	u, err := url.Parse(upstreamURL)
-	if err != nil {
-		return nil, err
-	}
-
-	var rc net.Conn
-	switch u.Scheme {
-	case "socks5":
-		p := socks.NewSocks5Proxy(u.Host, "", "")
-		rc, err = p.DialUDP(context.Background(), target, 5*time.Second, ebpf.GetDialerControl())
-	default:
-		return nil, fmt.Errorf("unsupported upstream scheme for UDP: %s", u.Scheme)
-	}
-
-	if err != nil {
-		ph.sm.ReportFailure(upstreamURL)
-		return nil, err
-	}
-	ph.sm.ReportSuccess(upstreamURL)
-	return rc, nil
+	return nil, fmt.Errorf("all UDP dial attempts failed, last error: %w", lastErr)
 }
 
 func (ph *ProxyHandler) forward(conn net.Conn, target string) {
@@ -653,7 +721,9 @@ func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 		TraceInfof(ctx, "Accepted connection from %s targeting %s", conn.RemoteAddr(), target)
 	}
 
-	if target == conn.LocalAddr().String() {
+	// Loop detection: prevent vproxy from connecting to itself.
+	// For TUN/GVisor, target == LocalAddr is expected behavior, so we only check this for REDIRECT/eBPF modes.
+	if target == conn.LocalAddr().String() && !tproxy.IsTUNConn(conn) {
 		TraceErrorf(ctx, "Loop detected: target is the same as local address %s, dropping connection", target)
 		return
 	}
@@ -675,15 +745,18 @@ func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 }
 
 // (Socks dialing is provided by the socks package.)
-func dialHTTP(proxyAddr, target string) (net.Conn, error) {
+func dialHTTPWithTimeout(proxyAddr, target string, timeout time.Duration) (net.Conn, error) {
 	d := net.Dialer{
-		Timeout: 5 * time.Second,
-		Control: ebpf.GetDialerControl(),
+		Timeout: timeout,
+		Control: GetDialerControl(),
 	}
 	conn, err := d.Dial("tcp", proxyAddr)
 	if err != nil {
 		return nil, err
 	}
+	
+	// Set read/write deadline for HTTP CONNECT handshake
+	conn.SetDeadline(time.Now().Add(timeout))
 	
 	// Create a buffered reader to read the response headers
 	br := bufio.NewReader(conn)
@@ -698,15 +771,39 @@ func dialHTTP(proxyAddr, target string) (net.Conn, error) {
 		return nil, fmt.Errorf("HTTP proxy error: %s", resp.Status)
 	}
 	
+	// Reset the deadline so normal connection operations are not timed out!
+	conn.SetDeadline(time.Time{})
+	
 	// Return a wrapped connection that includes any data already read into the buffer
 	Debugf("[Dial] Established HTTP CONNECT tunnel to %s via %s (buffered: %d bytes)", target, proxyAddr, br.Buffered())
 	return &peekedConn{Reader: br, Conn: conn}, nil
 }
 
-func dialDirect(target string) (net.Conn, error) {
-	d := net.Dialer{
-		Timeout: 5 * time.Second,
-		Control: ebpf.GetDialerControl(),
+func (ph *ProxyHandler) dialDirect(target string) (net.Conn, error) {
+	retryCount := ph.DialRetryCount
+	if retryCount <= 0 {
+		retryCount = 3
 	}
-	return d.Dial("tcp", target)
+	dialTimeout := ph.DialTimeout
+	if dialTimeout <= 0 {
+		dialTimeout = 5 * time.Second
+	}
+
+	var rc net.Conn
+	var lastErr error
+	for attempt := 1; attempt <= retryCount; attempt++ {
+		d := net.Dialer{
+			Timeout: dialTimeout,
+			Control: GetDialerControl(),
+		}
+		rc, lastErr = d.Dial("tcp", target)
+		if lastErr == nil {
+			return rc, nil
+		}
+		Debugf("[Dial] Direct dial attempt %d/%d to %s failed: %v", attempt, retryCount, target, lastErr)
+		if attempt < retryCount {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	return nil, lastErr
 }

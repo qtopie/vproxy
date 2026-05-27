@@ -14,6 +14,10 @@ import (
 	proxypkg "golang.org/x/net/proxy"
 )
 
+// DefaultDialerControl specifies the default dialer control function to use when bypassing transparent proxy redirection.
+var DefaultDialerControl func(network, address string, c syscall.RawConn) error
+
+
 // SOCKS request commands as defined in RFC 1928 section 4.
 const (
 	Version5        = 0x05 // SOCKS5 protocol version
@@ -111,7 +115,7 @@ func ReadAddr(r io.Reader) (Addr, error) {
 // It applies the same ebpf control (SO_MARK) used elsewhere to avoid redirect loops.
 func DialSocks5(proxyAddr, target string) (net.Conn, error) {
 	p := NewSocks5Proxy(proxyAddr, "", "")
-	return p.DialTCP(context.Background(), target, 5*time.Second, ebpf.GetDialerControl())
+	return p.DialTCP(context.Background(), target, 5*time.Second, DefaultDialerControl)
 }
 
 // SplitAddr slices a SOCKS address from beginning of b. Returns nil if failed.
@@ -221,23 +225,43 @@ func WriteReply(w io.Writer, rep Error, addr Addr) error {
 // ControlDialer wraps a control function to implement proxy.Dialer
 type ControlDialer struct {
 	Context context.Context
+	Timeout time.Duration
 	Control func(network, address string, c syscall.RawConn) error
 }
 
 func (d *ControlDialer) Dial(network, address string) (net.Conn, error) {
 	control := d.Control
 	if control == nil {
+		control = DefaultDialerControl
+	}
+	if control == nil {
 		control = ebpf.GetDialerControl()
 	}
+	timeout := d.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
 	nd := &net.Dialer{
-		Timeout: 5 * time.Second,
+		Timeout: timeout,
 		Control: control,
 	}
 	ctx := d.Context
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return nd.DialContext(ctx, network, address)
+	
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	
+	conn, err := nd.DialContext(dialCtx, network, address)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Set an initial deadline for SOCKS5 handshake/negotiation.
+	// This will be cleared by the caller (DialTCP or DialUDP) once the handshake finishes.
+	conn.SetDeadline(time.Now().Add(timeout))
+	return conn, nil
 }
 
 // Socks5Proxy implements an upstream SOCKS5 proxy with both TCP dialer and a
@@ -262,13 +286,20 @@ func (s *Socks5Proxy) DialTCP(ctx context.Context, targetAddr string, timeout ti
 
 	d := &ControlDialer{
 		Context: ctx,
+		Timeout: timeout,
 		Control: control,
 	}
 	dialer, err := proxypkg.SOCKS5("tcp", s.Addr, auth, d)
 	if err != nil {
 		return nil, err
 	}
-	return dialer.Dial("tcp", targetAddr)
+	conn, err := dialer.Dial("tcp", targetAddr)
+	if err != nil {
+		return nil, err
+	}
+	// Handshake successful, reset connection deadline so normal data transmission isn't cut off!
+	conn.SetDeadline(time.Time{})
+	return conn, nil
 }
 
 // DialUDP implements SOCKS5 UDP ASSOCIATE.
@@ -276,6 +307,7 @@ func (s *Socks5Proxy) DialUDP(ctx context.Context, targetAddr string, timeout ti
 	// 1. 建立 TCP 控制连接
 	d := &ControlDialer{
 		Context: ctx,
+		Timeout: timeout,
 		Control: control,
 	}
 	ctrlConn, err := d.Dial("tcp", s.Addr)
@@ -315,6 +347,9 @@ func (s *Socks5Proxy) DialUDP(ctx context.Context, targetAddr string, timeout ti
 
 	// 3. 创建本地 UDP Socket 准备与服务器的转发地址通信
 	if control == nil {
+		control = DefaultDialerControl
+	}
+	if control == nil {
 		control = ebpf.GetDialerControl()
 	}
 	nd := &net.Dialer{
@@ -333,6 +368,9 @@ func (s *Socks5Proxy) DialUDP(ctx context.Context, targetAddr string, timeout ti
 		udpConn.Close()
 		return nil, fmt.Errorf("invalid target address: %s", targetAddr)
 	}
+
+	// Handshake successful, reset ctrlConn deadline so the associate TCP control connection doesn't timeout!
+	ctrlConn.SetDeadline(time.Time{})
 
 	return &socksUDPConn{
 		UDPConn:  udpConn.(*net.UDPConn),
