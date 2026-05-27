@@ -70,9 +70,12 @@
 
 ## ⚙️ Configuration & Rules
 
-`vproxy` is configured via a JSON file (defaulting to `vproxy.json`).
+`vproxy` is configured via a JSON file. By default, it searches for a configuration file in the following order:
+1. Manually specified file (via `-c` flag).
+2. System-wide global config: `/etc/vproxy/config.json` (on Linux) or `~/.vproxy/config.json` (on macOS/Windows).
+3. Local file in the current directory: `vproxy.json`.
 
-### Configuration Example (`vproxy.json`)
+### Configuration Example (`/etc/vproxy/config.json` or `vproxy.json`)
 ```json
 {
   "upstreams": [

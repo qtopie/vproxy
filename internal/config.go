@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 type Config struct {
@@ -23,16 +24,20 @@ func LoadConfig(path string) (*Config, string, error) {
 	var data []byte
 	var err error
 
-	// 1. Resolve the default fallback path (~/.vproxy/config.json)
-	home, homeErr := os.UserHomeDir()
+	// 1. Resolve the default fallback path
 	defaultPath := ""
-	if homeErr == nil {
-		defaultPath = filepath.Join(home, ".vproxy", "config.json")
+	if runtime.GOOS == "linux" {
+		defaultPath = "/etc/vproxy/config.json"
+	} else {
+		home, homeErr := os.UserHomeDir()
+		if homeErr == nil {
+			defaultPath = filepath.Join(home, ".vproxy", "config.json")
+		}
 	}
 
 	// 2. Resolve final path priority
 	// Priority: 1. Manually specified path (if path != "vproxy.json")
-	//           2. Global config (~/.vproxy/config.json)
+	//           2. Global config (e.g. /etc/vproxy/config.json or ~/.vproxy/config.json)
 	//           3. Local directory (vproxy.json)
 
 	finalPath := path
