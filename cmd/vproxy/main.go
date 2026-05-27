@@ -67,7 +67,7 @@ func main() {
 			}
 			
 			fmt.Printf("vproxy: Setting up BPF capabilities for binary %s\n", binary)
-			exec.Command("setcap", "cap_net_admin,cap_net_bind_service,cap_bpf,cap_sys_resource,cap_dac_override+ep", binary).Run()
+			exec.Command("setcap", "cap_net_admin,cap_net_bind_service,cap_bpf,cap_sys_resource+ep", binary).Run()
 			
 			fmt.Println("vproxy: Setting up cgroups directory /sys/fs/cgroup/vproxy")
 			exec.Command("mkdir", "-p", "/sys/fs/cgroup/vproxy").Run()

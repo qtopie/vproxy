@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/qtopie/vproxy/internal/ipc"
 	"github.com/qtopie/vproxy/internal/mitm"
 	"github.com/qtopie/vproxy/proxy/cgroup"
 	"github.com/qtopie/vproxy/proxy/ebpf"
@@ -28,6 +29,7 @@ type App struct {
 	LocalTrans int
 	
 	ebpfResult *ebpf.LoadResult // Strong reference to prevent GC of eBPF FDs
+	ipcServer  *ipc.Server
 }
 
 func (a *App) RunServer() {
@@ -42,6 +44,14 @@ func (a *App) RunServer() {
 		msg := fmt.Sprintf("Failed to start HTTP proxy: %v", err)
 		fmt.Fprintln(os.Stderr, msg)
 		log.Fatal(msg)
+	}
+
+	// Start IPC Server for unprivileged wrappers to request cgroup migration
+	if srv, err := ipc.StartServer(); err == nil {
+		a.ipcServer = srv
+		Infof("IPC server started on %s", ipc.SocketPath)
+	} else {
+		Errorf("Failed to start IPC server: %v", err)
 	}
 
 	best := sm.GetBestServer()
@@ -128,6 +138,10 @@ func (a *App) RunServer() {
 		iptables.CleanupRules()
 	}
 
+	if a.ipcServer != nil {
+		a.ipcServer.Stop()
+	}
+
 	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
 		tproxy.Cleanup()
 	}
@@ -207,19 +221,24 @@ func (a *App) RunWrapper(args []string) {
 	// Always attempt cgroup migration on Linux if transparent proxying is POSSIBLE (either via this wrapper or background server)
 	if (needsEbpf || skipPrivileged) && a.Config.EnableEbpf != nil && *a.Config.EnableEbpf && runtime.GOOS == "linux" {
 		if err := cgroup.MoveProcessToVProxyCgroup(os.Getpid()); err != nil {
-			Debugf("Process migration to cgroup failed: %v", err)
-			if !skipPrivileged && needsEbpf {
-				msg := "vproxy process migration failed! Please initialize the environment by running: 'sudo vproxy init'"
-				fmt.Fprintln(os.Stderr, msg)
-				log.Fatal(msg)
+			Debugf("Direct cgroup migration failed (%v), trying IPC attach...", err)
+			if ipcErr := ipc.RequestAttach(os.Getpid()); ipcErr != nil {
+				Debugf("IPC attach failed: %v", ipcErr)
+				if !skipPrivileged && needsEbpf {
+					msg := "vproxy process migration failed! Please initialize the environment by running: 'sudo vproxy init'"
+					fmt.Fprintln(os.Stderr, msg)
+					log.Fatal(msg)
+				} else {
+					// If we failed to move to cgroup, it's not always fatal if skipPrivileged is true (maybe already there)
+					// but for tests it might be an issue.
+					msg := fmt.Sprintf("WARNING: Failed to move %s to vproxy cgroup via direct write or IPC: %v. Transparent proxying might NOT work.", cmdName, ipcErr)
+					Debugf(msg)
+				}
 			} else {
-				// If we failed to move to cgroup, it's not always fatal if skipPrivileged is true (maybe already there)
-				// but for tests it might be an issue.
-				msg := fmt.Sprintf("WARNING: Failed to move %s to vproxy cgroup: %v. Transparent proxying might NOT work.", cmdName, err)
-				Debugf(msg)
+				Debugf("Successfully moved process %d (%s) to vproxy cgroup via IPC", os.Getpid(), cmdName)
 			}
 		} else {
-			Debugf("Successfully moved process %d (%s) to vproxy cgroup for transparent interception", os.Getpid(), cmdName)
+			Debugf("Successfully moved process %d (%s) to vproxy cgroup via direct write", os.Getpid(), cmdName)
 		}
 		
 		// If we're on Linux, we also need to ensure SO_MARK is set for our own bridges
