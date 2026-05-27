@@ -3,7 +3,6 @@ test.sh
 config.json
 *.json
 **/*.o
-proxy/ebpf/bpf_bpfel.go
-proxy/ebpf/tc_bpf_bpfel.go
+proxy/ebpf/bpf_nogen_stub.go
 .antigravitycli/
 !.github/workflows/
