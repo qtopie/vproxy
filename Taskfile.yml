@@ -41,17 +41,27 @@ tasks:
       - go generate ./...
 
   release:
-    desc: Build release binaries for all platforms
+    desc: Build and package release binaries for all platforms
     cmds:
-      - mkdir -p dist
-      # Linux
-      - GOOS=linux GOARCH=amd64 go build -o dist/vproxy_linux_amd64 ./cmd/vproxy
-      - GOOS=linux GOARCH=arm64 go build -o dist/vproxy_linux_arm64 ./cmd/vproxy
-      # Darwin
-      - GOOS=darwin GOARCH=amd64 go build -o dist/vproxy_darwin_amd64 ./cmd/vproxy
-      - GOOS=darwin GOARCH=arm64 go build -o dist/vproxy_darwin_arm64 ./cmd/vproxy
-      # Windows
-      - GOOS=windows GOARCH=amd64 go build -o dist/vproxy_windows_amd64.exe ./cmd/vproxy
-      - GOOS=windows GOARCH=arm64 go build -o dist/vproxy_windows_arm64.exe ./cmd/vproxy
-      # Checksums
+      - rm -rf dist && mkdir -p dist
+      # Linux amd64
+      - GOOS=linux GOARCH=amd64 go build -o dist/vproxy ./cmd/vproxy
+      - tar -czf dist/vproxy_linux_amd64.tar.gz -C dist vproxy
+      # Linux arm64
+      - GOOS=linux GOARCH=arm64 go build -o dist/vproxy ./cmd/vproxy
+      - tar -czf dist/vproxy_linux_arm64.tar.gz -C dist vproxy
+      # Darwin amd64
+      - GOOS=darwin GOARCH=amd64 go build -o dist/vproxy ./cmd/vproxy
+      - tar -czf dist/vproxy_darwin_amd64.tar.gz -C dist vproxy
+      # Darwin arm64
+      - GOOS=darwin GOARCH=arm64 go build -o dist/vproxy ./cmd/vproxy
+      - tar -czf dist/vproxy_darwin_arm64.tar.gz -C dist vproxy
+      # Windows amd64
+      - GOOS=windows GOARCH=amd64 go build -o dist/vproxy.exe ./cmd/vproxy
+      - zip -j dist/vproxy_windows_amd64.zip dist/vproxy.exe
+      # Windows arm64
+      - GOOS=windows GOARCH=arm64 go build -o dist/vproxy.exe ./cmd/vproxy
+      - zip -j dist/vproxy_windows_arm64.zip dist/vproxy.exe
+      # Cleanup individual binaries and generate checksums
+      - rm -f dist/vproxy dist/vproxy.exe
       - cd dist && sha256sum * > checksums.txt
