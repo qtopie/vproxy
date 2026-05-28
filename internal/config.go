@@ -12,6 +12,7 @@ type Config struct {
 	Upstreams    []string `json:"upstreams"`
 	Rules        []string `json:"rules"`
 	TestInterval int      `json:"test_interval"` // seconds
+	WebPort        int      `json:"web_port,omitempty"`
 	EnableEbpf     *bool    `json:"enable_ebpf,omitempty"`
 	DirectDNS      *bool    `json:"direct_dns,omitempty"`
 	DialTimeoutMs  *int     `json:"dial_timeout_ms,omitempty"`
@@ -73,6 +74,9 @@ func LoadConfig(path string) (*Config, string, error) {
 	// 6. Apply defaults if missing
 	if cfg.TestInterval == 0 {
 		cfg.TestInterval = 30
+	}
+	if cfg.WebPort == 0 {
+		cfg.WebPort = 8899
 	}
 	if cfg.DirectDNS == nil {
 		trueVal := true

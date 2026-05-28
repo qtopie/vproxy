@@ -11,11 +11,14 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"bytes"
 	"crypto/tls"
 	"io"
+	"mime"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 
@@ -413,12 +416,20 @@ func (ph *ProxyHandler) serveHTTP() {
 				return
 			}
 
-			// Deep HTTPS Tracing (MITM) when verbose/debug mode is enabled
-			if IsVerbose() {
-				process := ""
-				if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
-					process, _ = tproxy.GetProcessNameByConn(conn)
-				}
+			process := ""
+			if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+				process, _ = tproxy.GetProcessNameByConn(conn)
+			}
+
+			// Check if we should intercept this connection (MITM)
+			hostOnly := req.Host
+			if h, _, err := net.SplitHostPort(req.Host); err == nil {
+				hostOnly = h
+			}
+			action, _ := ph.rm.MatchContext(MatchContext{Host: hostOnly, Process: process})
+
+			// Deep HTTPS Tracing (MITM) when verbose mode is on OR explicitly intercepted/mapped
+			if IsVerbose() || action == ActionIntercept || action == ActionMap {
 				// Establish TLS connection with the target server
 				serverTLS, err := ph.dialTargetTLS(req.Host, process)
 				if err != nil {
@@ -488,6 +499,37 @@ func (ph *ProxyHandler) handlePlainHTTP(client, server net.Conn, host string) {
 	for {
 		startTime := time.Now()
 
+		// 1. Whistle-like Mapping: Check if this specific URL should be hijacked
+		fullURL := fmt.Sprintf("https://%s%s", host, req.URL.RequestURI())
+		action, target := ph.rm.MatchURL(fullURL)
+		if action == ActionMap && strings.HasPrefix(target, "file://") {
+			localPath := strings.TrimPrefix(target, "file://")
+			ph.serveLocalFile(client, localPath)
+
+			// Record trace for the hijacked request
+			traceID := fmt.Sprintf("map-%04d", atomic.AddUint64(&traceCounter, 1))
+			PublishTrace(&TraceEntry{
+				ID:           traceID,
+				Timestamp:    startTime,
+				Method:       req.Method,
+				URL:          fullURL,
+				Path:         req.URL.Path,
+				Host:         host,
+				RequestProto: req.Proto,
+				StatusCode:   200,
+				RespHeaders:  http.Header{"X-VProxy-Map": []string{localPath}},
+				RespBody:     fmt.Sprintf("[Mapped to Local File: %s]", localPath),
+				LatencyMs:    float64(time.Since(startTime).Nanoseconds()) / 1e6,
+			})
+
+			// Wait for next request on the same connection
+			req, err = http.ReadRequest(clientReader)
+			if err != nil {
+				return
+			}
+			continue
+		}
+
 		var reqBodyBytes []byte
 		if req.Body != nil {
 			reqBodyBytes, _ = io.ReadAll(req.Body)
@@ -520,7 +562,7 @@ func (ph *ProxyHandler) handlePlainHTTP(client, server net.Conn, host string) {
 			ID:           traceID,
 			Timestamp:    startTime,
 			Method:       req.Method,
-			URL:          req.URL.String(),
+			URL:          fullURL,
 			Path:         req.URL.Path,
 			Host:         host,
 			RequestProto: req.Proto,
@@ -544,6 +586,46 @@ func (ph *ProxyHandler) handlePlainHTTP(client, server net.Conn, host string) {
 			return
 		}
 	}
+}
+
+func (ph *ProxyHandler) serveLocalFile(conn net.Conn, path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("MAP: failed to read local file %s: %v", path, err)
+		res := http.Response{
+			StatusCode: 404,
+			ProtoMajor: 1,
+			ProtoMinor: 1,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(bytes.NewBufferString("Local file not found by vproxy")),
+		}
+		res.Header.Set("Content-Type", "text/plain")
+		res.Write(conn)
+		return
+	}
+
+	contentType := mime.TypeByExtension(filepath.Ext(path))
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	header := make(http.Header)
+	header.Set("Content-Type", contentType)
+	header.Set("Content-Length", strconv.Itoa(len(data)))
+	header.Set("Access-Control-Allow-Origin", "*")
+	header.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE, PATCH")
+	header.Set("Access-Control-Allow-Headers", "*")
+	header.Set("Server", "vproxy-mitm")
+
+	res := http.Response{
+		Status:     "200 OK",
+		StatusCode: 200,
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     header,
+		Body:       io.NopCloser(bytes.NewBuffer(data)),
+	}
+	res.Write(conn)
 }
 
 func (ph *ProxyHandler) dialTargetTLS(target string, process string) (*tls.Conn, error) {
@@ -575,7 +657,7 @@ func (ph *ProxyHandler) dialTargetTLS(target string, process string) (*tls.Conn,
 func (ph *ProxyHandler) dialTarget(target string, process string) (net.Conn, error) {
 	host, portStr, _ := net.SplitHostPort(target)
 	port, _ := strconv.Atoi(portStr)
-	action := ph.rm.MatchContext(MatchContext{Host: host, Port: port, Process: process})
+	action, _ := ph.rm.MatchContext(MatchContext{Host: host, Port: port, Process: process})
 	if action == ActionDirect {
 		Debugf("[Dial] Target %s matches DIRECT rule, dialing directly", target)
 		return ph.dialDirect(target)
@@ -647,13 +729,15 @@ func (ph *ProxyHandler) dialTargetUDP(target string, process string) (net.Conn, 
 	if dialTimeout <= 0 {
 		dialTimeout = 5 * time.Second
 	}
-	retryCount := ph.DialRetryCount
-	if retryCount <= 0 {
-		retryCount = 3
+	dialRetryCount := ph.DialRetryCount
+	if dialRetryCount <= 0 {
+		dialRetryCount = 3
 	}
 
-	if ph.rm.MatchContext(MatchContext{Host: host, Port: port, Process: process}) == ActionDirect {
+	action, _ := ph.rm.MatchContext(MatchContext{Host: host, Port: port, Process: process})
+	if action == ActionDirect {
 		// Just dial directly for UDP bypassing proxy
+
 		d := net.Dialer{
 			Timeout: dialTimeout,
 			Control: GetDialerControl(),
@@ -664,7 +748,7 @@ func (ph *ProxyHandler) dialTargetUDP(target string, process string) (net.Conn, 
 	var rc net.Conn
 	var lastErr error
 
-	for attempt := 1; attempt <= retryCount; attempt++ {
+	for attempt := 1; attempt <= dialRetryCount; attempt++ {
 		upstreamURL := ph.sm.GetBestServer()
 		if upstreamURL == "" {
 			servers := ph.sm.GetServers()
@@ -693,11 +777,11 @@ func (ph *ProxyHandler) dialTargetUDP(target string, process string) (net.Conn, 
 			return rc, nil
 		}
 
-		Debugf("[Dial UDP] Attempt %d/%d to %s failed: %v", attempt, retryCount, upstreamURL, err)
+		Debugf("[Dial UDP] Attempt %d/%d to %s failed: %v", attempt, dialRetryCount, upstreamURL, err)
 		ph.sm.ReportFailure(upstreamURL)
 		lastErr = err
 
-		if attempt < retryCount {
+		if attempt < dialRetryCount {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}

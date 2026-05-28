@@ -102,8 +102,41 @@ func (jff *JSONFileFormatter) Format(entry *TraceEntry) {
 		return
 	}
 	defer f.Close()
+	f.Write(append(data, '\n'))
+}
 
-	_, _ = f.Write(append(data, '\n'))
+// MemoryTraceFormatter keeps the last N traces in memory.
+type MemoryTraceFormatter struct {
+	mu     sync.Mutex
+	Traces []*TraceEntry
+	Max    int
+}
+
+func NewMemoryTraceFormatter(max int) *MemoryTraceFormatter {
+	return &MemoryTraceFormatter{
+		Traces: make([]*TraceEntry, 0, max),
+		Max:    max,
+	}
+}
+
+func (m *MemoryTraceFormatter) Format(entry *TraceEntry) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if len(m.Traces) >= m.Max {
+		// Remove oldest
+		m.Traces = m.Traces[1:]
+	}
+	m.Traces = append(m.Traces, entry)
+}
+
+func (m *MemoryTraceFormatter) GetTraces() []*TraceEntry {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Return a copy
+	res := make([]*TraceEntry, len(m.Traces))
+	copy(res, m.Traces)
+	return res
 }
 
 func init() {

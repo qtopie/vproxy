@@ -14,6 +14,10 @@ const (
 	ActionDirect RuleAction = iota
 	// ActionProxy means the connection should go through the proxy.
 	ActionProxy
+	// ActionIntercept means the connection should be decrypted (MITM).
+	ActionIntercept
+	// ActionMap means the request should be mapped to a local file or another URL.
+	ActionMap
 )
 
 func (ra RuleAction) String() string {
@@ -22,6 +26,10 @@ func (ra RuleAction) String() string {
 		return "DIRECT"
 	case ActionProxy:
 		return "PROXY"
+	case ActionIntercept:
+		return "INTERCEPT"
+	case ActionMap:
+		return "MAP"
 	default:
 		return "DIRECT"
 	}
@@ -33,6 +41,7 @@ type RuleType int
 const (
 	RuleTypeDomain RuleType = iota
 	RuleTypeProcess
+	RuleTypeURL
 )
 
 // Rule represents a single routing rule.
@@ -40,6 +49,7 @@ type Rule struct {
 	Type    RuleType
 	Pattern string
 	Action  RuleAction
+	Target  string // Used for ActionMap (e.g., file:///path or http://url)
 }
 
 // MatchContext provides context for rule matching.
@@ -50,6 +60,7 @@ type MatchContext struct {
 	Host    string
 	Port    int
 	Process string // full executable path on macOS, command name elsewhere
+	URL     string // Full URL for HTTP mapping
 }
 
 // RuleManager manages a set of routing rules.
@@ -62,15 +73,11 @@ type RuleManager struct {
 // NewRuleManager creates a new RuleManager from a list of rules.
 // Rules can be:
 //   - "DOMAIN,example.com,PROXY"
-//   - "PROCESS,Telegram,DIRECT"                        (name substring — backward compatible)
-//   - "PROCESS,/Applications/Telegram.app,DIRECT"      (path-prefix match, more precise)
+//   - "PROCESS,Telegram,DIRECT"
+//   - "INTERCEPT,example.com"
+//   - "MAP,https://example.com/js/main.js,file:///tmp/main.js"
 //   - "example.com,PROXY"                              (defaults to DOMAIN)
 //   - "DEFAULT,DIRECT"
-//
-// PROCESS rules perform a case-insensitive substring match against the full
-// executable path of the process (on macOS) or its command name (elsewhere).
-// This means both short names like "Telegram" and path prefixes like
-// "/Applications/Telegram.app" correctly identify the same process.
 func NewRuleManager(ruleEntries []string) *RuleManager {
 	rm := &RuleManager{
 		rules:     make([]Rule, 0),
@@ -86,20 +93,31 @@ func NewRuleManager(ruleEntries []string) *RuleManager {
 		}
 
 		var ruleType RuleType = RuleTypeDomain
-		var pattern, actionStr string
+		var pattern, actionStr, target string
 
-		if len(parts) == 3 {
-			typeStr := strings.ToUpper(strings.TrimSpace(parts[0]))
+		p0 := strings.ToUpper(strings.TrimSpace(parts[0]))
+		if p0 == "MAP" && len(parts) >= 3 {
+			ruleType = RuleTypeURL
+			pattern = strings.TrimSpace(parts[1])
+			actionStr = "MAP"
+			target = strings.TrimSpace(parts[2])
+		} else if p0 == "INTERCEPT" {
+			ruleType = RuleTypeDomain
+			pattern = strings.TrimSpace(parts[1])
+			actionStr = "INTERCEPT"
+		} else if len(parts) == 3 {
 			pattern = strings.TrimSpace(parts[1])
 			actionStr = strings.ToUpper(strings.TrimSpace(parts[2]))
 
-			switch typeStr {
+			switch p0 {
 			case "DOMAIN":
 				ruleType = RuleTypeDomain
 			case "PROCESS":
 				ruleType = RuleTypeProcess
+			case "URL":
+				ruleType = RuleTypeURL
 			default:
-				log.Printf("Router: Unknown rule type '%s'. Skipping.", typeStr)
+				log.Printf("Router: Unknown rule type '%s'. Skipping.", p0)
 				continue
 			}
 		} else {
@@ -113,6 +131,10 @@ func NewRuleManager(ruleEntries []string) *RuleManager {
 			action = ActionDirect
 		case "PROXY":
 			action = ActionProxy
+		case "INTERCEPT":
+			action = ActionIntercept
+		case "MAP":
+			action = ActionMap
 		default:
 			log.Printf("Router: Unknown action '%s' in rule '%s'. Skipping.", actionStr, entry)
 			continue
@@ -123,7 +145,7 @@ func NewRuleManager(ruleEntries []string) *RuleManager {
 			continue
 		}
 
-		rm.rules = append(rm.rules, Rule{Type: ruleType, Pattern: pattern, Action: action})
+		rm.rules = append(rm.rules, Rule{Type: ruleType, Pattern: pattern, Action: action, Target: target})
 	}
 	return rm
 }
@@ -134,34 +156,39 @@ func (rm *RuleManager) SetDirectDNS(direct bool) {
 }
 
 // Match matches a host against the configured rules.
-func (rm *RuleManager) Match(host string) RuleAction {
+func (rm *RuleManager) Match(host string) (RuleAction, string) {
 	return rm.MatchContext(MatchContext{Host: host})
 }
 
-// MatchContext matches a request context against the rules.
-func (rm *RuleManager) MatchContext(ctx MatchContext) RuleAction {
-	action := rm.doMatchContext(ctx)
-	if IsVerbose() {
-		Debugf("Router: Match %s (Port: %d, Process: %s) -> %s", ctx.Host, ctx.Port, ctx.Process, action)
-	}
-	return action
+// MatchURL matches a full URL against the configured rules.
+func (rm *RuleManager) MatchURL(url string) (RuleAction, string) {
+	return rm.MatchContext(MatchContext{URL: url})
 }
 
-func (rm *RuleManager) doMatchContext(ctx MatchContext) RuleAction {
+// MatchContext matches a request context against the rules.
+func (rm *RuleManager) MatchContext(ctx MatchContext) (RuleAction, string) {
+	action, target := rm.doMatchContext(ctx)
+	if IsVerbose() {
+		Debugf("Router: Match %s (Port: %d, Process: %s, URL: %s) -> %s (Target: %s)", ctx.Host, ctx.Port, ctx.Process, ctx.URL, action, target)
+	}
+	return action, target
+}
+
+func (rm *RuleManager) doMatchContext(ctx MatchContext) (RuleAction, string) {
 	// 0. Always direct for DNS to avoid UDP relay issues with some upstreams
 	if rm.directDNS && ctx.Port == 53 {
-		return ActionDirect
+		return ActionDirect, ""
 	}
 
 	// 1. Check for localhost and loopback IP
 	if ctx.Host == "localhost" || ctx.Host == "127.0.0.1" || ctx.Host == "::1" {
-		return ActionDirect
+		return ActionDirect, ""
 	}
 
 	// 2. Check for IP and special ranges
 	if ip := net.ParseIP(ctx.Host); ip != nil {
 		if isPrivateIP(ip) {
-			return ActionDirect
+			return ActionDirect, ""
 		}
 	}
 
@@ -170,24 +197,41 @@ func (rm *RuleManager) doMatchContext(ctx MatchContext) RuleAction {
 		switch rule.Type {
 		case RuleTypeProcess:
 			if ctx.Process != "" && (ctx.Process == rule.Pattern || strings.Contains(strings.ToLower(ctx.Process), strings.ToLower(rule.Pattern))) {
-				return rule.Action
+				return rule.Action, rule.Target
 			}
 		case RuleTypeDomain:
+			if ctx.Host == "" {
+				continue
+			}
 			host := ctx.Host
 			if strings.HasPrefix(rule.Pattern, ".") { // e.g., .google.com
 				trimmedPattern := strings.TrimPrefix(rule.Pattern, ".")
 				if host == trimmedPattern || strings.HasSuffix(host, rule.Pattern) {
-					return rule.Action
+					return rule.Action, rule.Target
 				}
 			} else { // e.g., example.com
 				if host == rule.Pattern || strings.HasSuffix(host, "."+rule.Pattern) {
-					return rule.Action
+					return rule.Action, rule.Target
+				}
+			}
+		case RuleTypeURL:
+			if ctx.URL != "" {
+				// Simple prefix or contains match for URL
+				if strings.HasPrefix(ctx.URL, rule.Pattern) || strings.Contains(ctx.URL, rule.Pattern) {
+					return rule.Action, rule.Target
+				}
+			} else if ctx.Host != "" {
+				// At connection level (CONNECT), we only have Host.
+				// If a MAP rule's pattern contains this host, we return ActionMap
+				// to trigger MITM so we can match the full URL later.
+				if strings.Contains(rule.Pattern, ctx.Host) {
+					return rule.Action, rule.Target
 				}
 			}
 		}
 	}
 	// Default to PROXY if no specific rule matches
-	return rm.defaultAction
+	return rm.defaultAction, ""
 }
 
 // isPrivateIP checks if an IP address is a private, loopback, or link-local address.

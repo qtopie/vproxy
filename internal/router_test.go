@@ -88,6 +88,18 @@ func TestMatch(t *testing.T) {
 			process:    "SomeApp",
 			wantAction: ActionProxy,
 		},
+		{
+			name:       "Intercept match",
+			rules:      []string{"INTERCEPT,example.com"},
+			host:       "example.com",
+			wantAction: ActionIntercept,
+		},
+		{
+			name:       "Map match URL",
+			rules:      []string{"MAP,https://example.com/js/main.js,file:///tmp/main.js"},
+			host:       "example.com",
+			wantAction: ActionMap,
+		},
 	}
 
 	for _, tt := range tests {
@@ -96,7 +108,7 @@ func TestMatch(t *testing.T) {
 			if tt.name == "DNS Proxy (explicitly disabled direct)" {
 				rm.SetDirectDNS(false)
 			}
-			got := rm.MatchContext(MatchContext{
+			got, _ := rm.MatchContext(MatchContext{
 				Host:    tt.host,
 				Port:    tt.port,
 				Process: tt.process,
@@ -106,4 +118,33 @@ func TestMatch(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMatchURL(t *testing.T) {
+	rules := []string{
+		"MAP,https://example.com/js/main.js,file:///tmp/main.js",
+		"INTERCEPT,intercept.me",
+	}
+	rm := NewRuleManager(rules)
+
+	t.Run("Map exact URL", func(t *testing.T) {
+		action, target := rm.MatchURL("https://example.com/js/main.js")
+		if action != ActionMap || target != "file:///tmp/main.js" {
+			t.Errorf("MatchURL failed: got %v, %s", action, target)
+		}
+	})
+
+	t.Run("Map partial URL", func(t *testing.T) {
+		action, target := rm.MatchURL("https://example.com/js/main.js?v=1")
+		if action != ActionMap || target != "file:///tmp/main.js" {
+			t.Errorf("MatchURL failed: got %v, %s", action, target)
+		}
+	})
+
+	t.Run("Intercept host", func(t *testing.T) {
+		action, _ := rm.Match("intercept.me")
+		if action != ActionIntercept {
+			t.Errorf("Match host failed: got %v", action)
+		}
+	})
 }

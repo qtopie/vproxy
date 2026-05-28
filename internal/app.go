@@ -30,11 +30,23 @@ type App struct {
 	
 	ebpfResult *ebpf.LoadResult // Strong reference to prevent GC of eBPF FDs
 	ipcServer  *ipc.Server
+	ph         *ProxyHandler
+}
+
+func (a *App) getProxyHandler() *ProxyHandler {
+	return a.ph
 }
 
 func (a *App) RunServer() {
 	sm, ph := a.setupServices()
+	a.ph = ph
 	sm.Start()
+
+	// 1. Setup Management Web UI
+	mtf := NewMemoryTraceFormatter(100)
+	RegisterFormatter(mtf)
+	StartWebServer(a, mtf)
+
 	if err := ph.StartSocks(); err != nil {
 		msg := fmt.Sprintf("Failed to start SOCKS5 proxy: %v", err)
 		fmt.Fprintln(os.Stderr, msg)
