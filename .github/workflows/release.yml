@@ -35,10 +35,14 @@ jobs:
           sudo apt-get install -y clang llvm libbpf-dev
 
       - name: Run Go Generate
+        run: go generate -v ./...
+
+      - name: Verify Generated Files
         run: |
-          # Ensure bpf2go tool is available and generate eBPF code
-          go run github.com/cilium/ebpf/cmd/bpf2go -target bpfel -tags "linux,!android" -output-dir proxy/ebpf bpf proxy/ebpf/bpf/redirect.c
-          go run github.com/cilium/ebpf/cmd/bpf2go -target bpfel -tags "linux,!android" -output-dir proxy/ebpf tc_bpf proxy/ebpf/bpf/tc_redirect.c
+          ls -l proxy/ebpf/bpf_bpfel.go
+          ls -l proxy/ebpf/bpf_bpfel.o
+          ls -l proxy/ebpf/tc_bpf_bpfel.go
+          ls -l proxy/ebpf/tc_bpf_bpfel.o
 
       - name: Run Tests
         run: go test -v ./...
@@ -75,9 +79,7 @@ jobs:
           sudo apt-get install -y clang llvm libbpf-dev
 
       - name: Run Go Generate
-        run: |
-          go run github.com/cilium/ebpf/cmd/bpf2go -target bpfel -tags "linux,!android" -output-dir proxy/ebpf bpf proxy/ebpf/bpf/redirect.c
-          go run github.com/cilium/ebpf/cmd/bpf2go -target bpfel -tags "linux,!android" -output-dir proxy/ebpf tc_bpf proxy/ebpf/bpf/tc_redirect.c
+        run: go generate -v ./...
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
