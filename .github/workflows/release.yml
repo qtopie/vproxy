@@ -32,7 +32,9 @@ jobs:
       - name: Install dependencies (Linux eBPF)
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev
+          sudo apt-get install -y clang llvm libbpf-dev gcc-multilib
+          # Fix missing asm/types.h on some Ubuntu environments
+          sudo ln -s /usr/include/x86_64-linux-gnu/asm /usr/include/asm
 
       - name: Run Go Generate
         run: go generate -v ./...
@@ -76,7 +78,8 @@ jobs:
       - name: Install dependencies (Linux eBPF)
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev
+          sudo apt-get install -y clang llvm libbpf-dev gcc-multilib
+          sudo ln -s /usr/include/x86_64-linux-gnu/asm /usr/include/asm
 
       - name: Run Go Generate
         run: go generate -v ./...
