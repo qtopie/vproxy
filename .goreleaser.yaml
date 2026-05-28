@@ -16,30 +16,8 @@ builds:
     goarch:
       - arm64
       - amd64
-  - id: vproxy
-    main: ./cmd/vproxy
-    binary: vproxy
-    env:
-      - CGO_ENABLED=0
-    goos:
-      - darwin
-      - windows
-      - linux
-    goarch:
-      - arm64
-      - amd64
 
 archives:
-  - id: vproxy
-    builds:
-      - vproxy
-    format: tar.gz
-    name_template: "vproxy_{{ .Tag }}_{{ .Os }}_{{ .Arch }}"
-    files:
-      - none*
-    format_overrides:
-      - goos: windows
-        format: zip
   - id: vproxy
     builds:
       - vproxy
