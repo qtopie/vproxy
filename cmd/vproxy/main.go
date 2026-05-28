@@ -41,8 +41,15 @@ func main() {
 		os.Setenv("VP_USE_TUN", "1")
 	}
 
-	// Handle 'clean' command
-	if len(args) > 0 && args[0] == "clean" {
+	if len(args) == 0 {
+		printUsage()
+		return
+	}
+
+	command := args[0]
+
+	switch command {
+	case "clean":
 		if os.Geteuid() != 0 {
 			log.Fatal("'clean' command requires sudo privileges")
 		}
@@ -51,10 +58,13 @@ func main() {
 		tproxy.Cleanup()
 		fmt.Println("vproxy: environment cleaned.")
 		return
-	}
 
-	// Handle 'init' command
-	if len(args) > 0 && args[0] == "init" {
+	case "stop":
+		stopBackgroundServer()
+		fmt.Println("vproxy: background server stopped.")
+		return
+
+	case "init":
 		if os.Geteuid() != 0 {
 			log.Fatal("'init' command requires sudo privileges")
 		}
@@ -64,17 +74,17 @@ func main() {
 		if err != nil {
 			log.Fatalf("init failed: %v", err)
 		}
-		
+
 		binary, err := os.Executable()
 		if err == nil {
 			sudoUser := os.Getenv("SUDO_USER")
 			if sudoUser == "" {
 				sudoUser = "root"
 			}
-			
+
 			fmt.Printf("vproxy: Setting up BPF capabilities for binary %s\n", binary)
 			exec.Command("setcap", "cap_net_admin,cap_net_bind_service,cap_bpf,cap_sys_resource+ep", binary).Run()
-			
+
 			fmt.Println("vproxy: Setting up cgroups directory /sys/fs/cgroup/vproxy")
 			exec.Command("mkdir", "-p", "/sys/fs/cgroup/vproxy").Run()
 			exec.Command("chown", "-R", sudoUser, "/sys/fs/cgroup/vproxy").Run()
@@ -82,8 +92,24 @@ func main() {
 
 		startBackgroundServer(resolvedPath)
 		return
+
+	case "start":
+		cfg, finalPath, err := vlink.LoadConfig(*configPath)
+		if err != nil {
+			log.Fatalf("Failed to load config: %v", err)
+		}
+		vproxy := &vlink.App{
+			Config:     cfg,
+			ConfigPath: finalPath,
+			LocalSocks: *localSocks,
+			LocalHTTP:  *localHTTP,
+			LocalTrans: *localTrans,
+		}
+		vproxy.RunServer()
+		return
 	}
 
+	// Not a built-in subcommand, treat as a wrapper: vproxy curl ...
 	cfg, finalPath, err := vlink.LoadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -97,14 +123,12 @@ func main() {
 
 	// Redirect logs to a file to keep console clean for the wrapped command
 	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("vproxy-%d.log", os.Getpid()))
-	if len(args) > 0 {
-		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err == nil {
-			vlink.SetOutput(f)
-			fmt.Fprintf(os.Stderr, "vproxy: logging to %s\n", logPath)
-		} else {
-			fmt.Fprintf(os.Stderr, "vproxy: failed to open log file %s: %v\n", logPath, err)
-		}
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err == nil {
+		vlink.SetOutput(f)
+		fmt.Fprintf(os.Stderr, "vproxy: logging to %s\n", logPath)
+	} else {
+		fmt.Fprintf(os.Stderr, "vproxy: failed to open log file %s: %v\n", logPath, err)
 	}
 
 	vproxy := &vlink.App{
@@ -116,21 +140,27 @@ func main() {
 	}
 	vlink.Debugf("vproxy app initialized with config: %s", finalPath)
 
-	if len(args) > 0 {
-		// If it's a command like 'vproxy agy'
-		cmdName := args[0]
-		vlink.Debugf("Target command: %s", cmdName)
-		
-		// 1. Ensure the command is in our PROCESS proxy list
-		ensureProcessInConfig(finalPath, cfg, cmdName)
-		
-		// 2. Run the command. 
-		vproxy.RunWrapper(args)
-		return
-	}
+	// If it's a command like 'vproxy agy'
+	cmdName := args[0]
+	vlink.Debugf("Target command: %s", cmdName)
 
-	// Default: Run as foreground server
-	vproxy.RunServer()
+	// 1. Ensure the command is in our PROCESS proxy list
+	ensureProcessInConfig(finalPath, cfg, cmdName)
+
+	// 2. Run the command.
+	vproxy.RunWrapper(args)
+}
+
+func printUsage() {
+	fmt.Println("Usage: vproxy [options] <command> [args...]")
+	fmt.Println("\nCommands:")
+	fmt.Println("  start         Run vproxy server in foreground (includes Web UI)")
+	fmt.Println("  init          Perform privileged setup and start background daemon")
+	fmt.Println("  stop          Stop the background daemon")
+	fmt.Println("  clean         Clean up environment and stop daemon (requires sudo)")
+	fmt.Println("  <cmd> [args]  Run an external command through vproxy (e.g., vproxy curl ...)")
+	fmt.Println("\nOptions:")
+	flag.PrintDefaults()
 }
 
 func startBackgroundServer(config string) {
