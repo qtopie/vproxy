@@ -29,15 +29,20 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
 
+      - name: Install Task
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install dependencies (Linux eBPF)
         run: |
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev gcc-multilib
-          # Fix missing asm/types.h on some Ubuntu environments
           sudo ln -s /usr/include/x86_64-linux-gnu/asm /usr/include/asm
 
       - name: Run Go Generate
-        run: go generate -v ./...
+        run: task generate
 
       - name: Verify Generated Files
         run: |
@@ -49,14 +54,8 @@ jobs:
       - name: Run Tests
         run: go test -v ./...
 
-      - name: Build Check (Linux)
-        run: go build -v ./...
-
-      - name: Build Check (macOS)
-        run: GOOS=darwin GOARCH=amd64 go build -v ./...
-
-      - name: Build Check (Windows)
-        run: GOOS=windows GOARCH=amd64 go build -v ./...
+      - name: Build Check
+        run: task default
 
   release:
     name: Build & Release Packages
@@ -75,6 +74,12 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
 
+      - name: Install Task
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install dependencies (Linux eBPF)
         run: |
           sudo apt-get update
@@ -82,13 +87,15 @@ jobs:
           sudo ln -s /usr/include/x86_64-linux-gnu/asm /usr/include/asm
 
       - name: Run Go Generate
-        run: go generate -v ./...
+        run: task generate
 
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+      - name: Build Release Binaries
+        run: task release
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
-          distribution: goreleaser
-          version: latest
-          args: release --clean
+          files: |
+            dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.CI_TOKEN }}
