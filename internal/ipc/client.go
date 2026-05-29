@@ -9,6 +9,18 @@ import (
 
 const SocketPath = "/tmp/vproxy.sock"
 
+type RequestType string
+
+const (
+	TypeAttach RequestType = "attach"
+	TypeStatus RequestType = "status"
+)
+
+type Request struct {
+	Type RequestType     `json:"type"`
+	Data json.RawMessage `json:"data"`
+}
+
 type AttachRequest struct {
 	PID int `json:"pid"`
 }
@@ -16,6 +28,13 @@ type AttachRequest struct {
 type AttachResponse struct {
 	Success bool   `json:"success"`
 	Error   string `json:"error,omitempty"`
+}
+
+type StatusResponse struct {
+	Success bool   `json:"success"`
+	Error   string `json:"error,omitempty"`
+	Version string `json:"version"`
+	Uptime  string `json:"uptime"`
 }
 
 // RequestAttach sends an attach request to the background vproxy daemon.
@@ -26,7 +45,11 @@ func RequestAttach(pid int) error {
 	}
 	defer conn.Close()
 
-	req := AttachRequest{PID: pid}
+	attachData, _ := json.Marshal(AttachRequest{PID: pid})
+	req := Request{
+		Type: TypeAttach,
+		Data: attachData,
+	}
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		return fmt.Errorf("failed to send attach request: %v", err)
 	}
@@ -43,3 +66,28 @@ func RequestAttach(pid int) error {
 
 	return nil
 }
+
+// RequestStatus sends a status request to the background vproxy daemon.
+func RequestStatus() (*StatusResponse, error) {
+	conn, err := net.DialTimeout("unix", SocketPath, 100*time.Millisecond)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to vproxy daemon (is it running?): %v", err)
+	}
+	defer conn.Close()
+
+	req := Request{
+		Type: TypeStatus,
+	}
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return nil, fmt.Errorf("failed to send status request: %v", err)
+	}
+
+	var resp StatusResponse
+	conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		return nil, fmt.Errorf("failed to read status response: %v", err)
+	}
+
+	return &resp, nil
+}
+

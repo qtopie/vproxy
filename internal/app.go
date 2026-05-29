@@ -37,6 +37,11 @@ func (a *App) getProxyHandler() *ProxyHandler {
 	return a.ph
 }
 
+// RequestStatus delegates to the IPC client to query the background daemon's status.
+func RequestStatus() (*ipc.StatusResponse, error) {
+	return ipc.RequestStatus()
+}
+
 func (a *App) RunServer() {
 	sm, ph := a.setupServices()
 	a.ph = ph
@@ -170,13 +175,24 @@ func (a *App) RunWrapper(args []string) {
 	isTUN := os.Getenv("VP_USE_TUN") == "1"
 	needsEbpf := true
 	needsTransparent := true
+	needsBridges := true
 	if isTUN {
 		needsEbpf = false
 	} else {
 		switch baseName {
 		case "curl", "git", "code", "gemini", "test_ebpf", "test_tproxy":
+			// Tools in this list should NOT be intercepted by eBPF/iptables.
+			// They are either proxy-aware (via env vars) or part of the test suite.
+			// 'gemini' uses standard HTTP_PROXY/HTTPS_PROXY.
 			needsEbpf = false
 			needsTransparent = false
+			needsBridges = true
+		case "agy":
+			// 'agy' MUST use transparent proxy (cgroup redirection) to work correctly on Linux.
+			// Do not add to the whitelist above.
+			needsEbpf = true
+			needsTransparent = true
+			needsBridges = false
 		}
 	}
 
@@ -225,13 +241,16 @@ func (a *App) RunWrapper(args []string) {
 
 	// 1. Setup Transparent Proxying Components
 	skipPrivileged := false
-	if _, err := os.Stat("/tmp/vproxy.pid"); err == nil {
+	pidFile := filepath.Join(os.TempDir(), "vproxy.pid")
+	Debugf("Checking for background daemon at %s", pidFile)
+	if _, err := os.Stat(pidFile); err == nil {
 		skipPrivileged = true
 		Debugf("Background vproxy detected, skipping privileged server setup")
 	}
 
-	// Always attempt cgroup migration on Linux if transparent proxying is POSSIBLE (either via this wrapper or background server)
-	if (needsEbpf || skipPrivileged) && a.Config.EnableEbpf != nil && *a.Config.EnableEbpf && runtime.GOOS == "linux" {
+	// Always attempt cgroup migration on Linux if transparent proxying is REQUESTED for this command
+	// Note: 'agy' requires this migration even if a background server is already handling rules.
+	if needsEbpf && a.Config.EnableEbpf != nil && *a.Config.EnableEbpf && runtime.GOOS == "linux" {
 		if err := cgroup.MoveProcessToVProxyCgroup(os.Getpid()); err != nil {
 			Debugf("Direct cgroup migration failed (%v), trying IPC attach...", err)
 			if ipcErr := ipc.RequestAttach(os.Getpid()); ipcErr != nil {
@@ -258,19 +277,21 @@ func (a *App) RunWrapper(args []string) {
 		SetDialerControl(ebpf.GetDialerControl())
 	}
 
-	if !skipPrivileged && (isTUN || (a.Config.EnableEbpf != nil && *a.Config.EnableEbpf)) && runtime.GOOS == "linux" && needsTransparent {
+	if (needsEbpf || skipPrivileged) && (isTUN || (a.Config.EnableEbpf != nil && *a.Config.EnableEbpf)) && runtime.GOOS == "linux" && needsTransparent {
 		// Check if we have permissions to set SO_MARK (requires CAP_NET_ADMIN)
-		if err := ebpf.CheckPermission(); err != nil && !isTUN {
-			msg := "vproxy permission check failed! Please initialize the environment by running: 'sudo vproxy init'"
-			fmt.Fprintln(os.Stderr, msg)
-			log.Fatal(msg)
-		}
+		if !skipPrivileged {
+			if err := ebpf.CheckPermission(); err != nil && !isTUN {
+				msg := "vproxy permission check failed! Please initialize the environment by running: 'sudo vproxy init'"
+				fmt.Fprintln(os.Stderr, msg)
+				log.Fatal(msg)
+			}
 
-		// Ensure cgroup exists (already moved to it above, but ensure directory exists)
-		if err := cgroup.EnsureVProxyCgroup(); err != nil && !isTUN {
-			msg := "vproxy permission check failed! Please initialize the environment by running: 'sudo vproxy init'"
-			fmt.Fprintln(os.Stderr, msg)
-			log.Fatal(msg)
+			// Ensure cgroup exists (already moved to it above, but ensure directory exists)
+			if err := cgroup.EnsureVProxyCgroup(); err != nil && !isTUN {
+				msg := "vproxy permission check failed! Please initialize the environment by running: 'sudo vproxy init'"
+				fmt.Fprintln(os.Stderr, msg)
+				log.Fatal(msg)
+			}
 		}
 
 		// Attempt eBPF-native redirect (kernel >= 5.7).
@@ -279,11 +300,18 @@ func (a *App) RunWrapper(args []string) {
 		if isUpstreamTProxyAlive {
 			setupTarget = bestURL.Host
 		} else {
-			if err := ph.StartTransparent(); err != nil {
-				msg := fmt.Sprintf("Failed to start transparent bridge: %v", err)
-				fmt.Fprintln(os.Stderr, msg)
+			if !skipPrivileged {
+				if err := ph.StartTransparent(); err != nil {
+					msg := fmt.Sprintf("Failed to start transparent bridge: %v", err)
+					fmt.Fprintln(os.Stderr, msg)
+				}
+				setupTarget = fmt.Sprintf("%d", ph.TransPort)
+			} else {
+				// If background server is running, we don't need to start a local bridge 
+				// or setup iptables rules here. The background server handles it.
+				Debugf("Background vproxy handles transparent proxying, skipping local bridge/iptables setup")
+				needsEbpf = false // Stop further setup in this wrapper
 			}
-			setupTarget = fmt.Sprintf("127.0.0.1:%d", ph.TransPort)
 		}
 
 		if needsEbpf {
@@ -353,10 +381,10 @@ func (a *App) RunWrapper(args []string) {
 	}
 
 	// If background vproxy is running and this tool needs transparent proxying, 
-	// we don't need to set environment variables because TUN/iptables will intercept it.
+	// we don't need to set environment variables or start bridges because TUN/iptables/eBPF will intercept it.
 	// For tools that use env-vars (needsEbpf=false), we always proceed to set them.
-	if skipPrivileged && needsEbpf {
-		Debugf("Background vproxy detected, executing %s directly (intercepted by system-wide rules)", cmdName)
+	if (skipPrivileged || needsTransparent) && needsEbpf {
+		Debugf("Transparent proxying active (skipPrivileged=%v), executing %s directly", skipPrivileged, cmdName)
 		cmd := exec.Command(cmdName, cmdArgs...)
 		cmd.Env = env
 		cmd.Stdout = os.Stdout
@@ -382,38 +410,42 @@ func (a *App) RunWrapper(args []string) {
 	baseName = filepath.Base(cmdName)
 	switch baseName {
 	case "curl", "git", "gemini":
+		// 'agy' is excluded here to ensure it doesn't get HTTP_PROXY env vars 
+		// that might conflict with its transparent proxying requirement.
 		isHTTPTool = true
 	default:
 		isHTTPTool = false
 	}
 
 	// Determine HTTP proxy requirement
-	if bestURL.Scheme == "http" {
-		finalHTTPProxy = best
-		Debugf("Protocol match: using upstream HTTP proxy directly for %s", cmdName)
-	} else {
-		if err := ph.StartHTTP(); err != nil {
-			msg := fmt.Sprintf("Failed to start local HTTP bridge: %v", err)
-			fmt.Fprintln(os.Stderr, msg)
-			log.Fatal(msg)
-		}
-		finalHTTPProxy = fmt.Sprintf("http://127.0.0.1:%d", ph.HttpPort)
-		Debugf("Protocol mismatch (upstream is %s): started local HTTP bridge at %s", bestURL.Scheme, finalHTTPProxy)
-	}
-
-	// Determine SOCKS5 proxy requirement (only if not a specific HTTP tool)
-	if !isHTTPTool {
-		if bestURL.Scheme == "socks5" {
-			finalSocksProxy = best
-			Debugf("Protocol match: using upstream SOCKS5 proxy directly")
+	if needsBridges {
+		if bestURL.Scheme == "http" {
+			finalHTTPProxy = best
+			Debugf("Protocol match: using upstream HTTP proxy directly for %s", cmdName)
 		} else {
-			if err := ph.StartSocks(); err != nil {
-				msg := fmt.Sprintf("Failed to start local SOCKS5 bridge: %v", err)
+			if err := ph.StartHTTP(); err != nil {
+				msg := fmt.Sprintf("Failed to start local HTTP bridge: %v", err)
 				fmt.Fprintln(os.Stderr, msg)
 				log.Fatal(msg)
 			}
-			finalSocksProxy = fmt.Sprintf("socks5://127.0.0.1:%d", ph.SocksPort)
-			Debugf("Protocol mismatch (upstream is %s): started local SOCKS5 bridge at %s", bestURL.Scheme, finalSocksProxy)
+			finalHTTPProxy = fmt.Sprintf("http://127.0.0.1:%d", ph.HttpPort)
+			Debugf("Protocol mismatch (upstream is %s): started local HTTP bridge at %s", bestURL.Scheme, finalHTTPProxy)
+		}
+
+		// Determine SOCKS5 proxy requirement (only if not a specific HTTP tool)
+		if !isHTTPTool {
+			if bestURL.Scheme == "socks5" {
+				finalSocksProxy = best
+				Debugf("Protocol match: using upstream SOCKS5 proxy directly")
+			} else {
+				if err := ph.StartSocks(); err != nil {
+					msg := fmt.Sprintf("Failed to start local SOCKS5 bridge: %v", err)
+					fmt.Fprintln(os.Stderr, msg)
+					log.Fatal(msg)
+				}
+				finalSocksProxy = fmt.Sprintf("socks5://127.0.0.1:%d", ph.SocksPort)
+				Debugf("Protocol mismatch (upstream is %s): started local SOCKS5 bridge at %s", bestURL.Scheme, finalSocksProxy)
+			}
 		}
 	}
 
@@ -425,6 +457,7 @@ func (a *App) RunWrapper(args []string) {
 		// VS Code uses --proxy-server argument
 		newArgs = append([]string{fmt.Sprintf("--proxy-server=%s", finalHTTPProxy)}, cmdArgs...)
 	case "git", "gemini":
+		// 'agy' uses transparent proxy, so it doesn't need HTTP_PROXY env vars.
 		env = append(env, fmt.Sprintf("HTTP_PROXY=%s", finalHTTPProxy))
 		env = append(env, fmt.Sprintf("HTTPS_PROXY=%s", finalHTTPProxy))
 		env = a.appendNoProxyEnv(env)

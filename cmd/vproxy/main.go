@@ -49,6 +49,33 @@ func main() {
 	command := args[0]
 
 	switch command {
+	case "status":
+		fmt.Printf("vproxy status:\n")
+
+		// 1. Check for background daemon via PID file
+		data, err := os.ReadFile(pidFile)
+		if err == nil {
+			pid, _ := strconv.Atoi(string(data))
+			if _, err := os.FindProcess(pid); err == nil {
+				fmt.Printf("  Background Daemon: Running (PID: %d)\n", pid)
+
+				// 2. Try to get detailed status via IPC
+				if resp, err := vlink.RequestStatus(); err == nil {
+					fmt.Printf("  Version:           %s\n", resp.Version)
+					fmt.Printf("  Uptime:            %s\n", resp.Uptime)
+				} else {
+					fmt.Printf("  IPC Detail:        Unavailable (%v)\n", err)
+				}
+			} else {
+				fmt.Printf("  Background Daemon: Stale PID file found (PID: %d)\n", pid)
+			}
+		} else {
+			fmt.Printf("  Background Daemon: Not running\n")
+		}
+
+		fmt.Printf("  Config Path:       %s\n", *configPath)
+		return
+
 	case "clean":
 		if os.Geteuid() != 0 {
 			log.Fatal("'clean' command requires sudo privileges")
@@ -157,6 +184,7 @@ func printUsage() {
 	fmt.Println("  start         Run vproxy server in foreground (includes Web UI)")
 	fmt.Println("  init          Perform privileged setup and start background daemon")
 	fmt.Println("  stop          Stop the background daemon")
+	fmt.Println("  status        Display current server status")
 	fmt.Println("  clean         Clean up environment and stop daemon (requires sudo)")
 	fmt.Println("  <cmd> [args]  Run an external command through vproxy (e.g., vproxy curl ...)")
 	fmt.Println("\nOptions:")
@@ -171,7 +199,7 @@ func startBackgroundServer(config string) {
 	}
 
 	binary, _ := os.Executable()
-	bgArgs := []string{"-c", config}
+	bgArgs := []string{"-c", config, "start"}
 	if *useTun {
 		bgArgs = append(bgArgs, "-tun")
 	}
@@ -230,4 +258,3 @@ func ensureProcessInConfig(path string, cfg *vlink.Config, proc string) {
 		fmt.Printf("vproxy: added '%s' to proxy rules\n", proc)
 	}
 }
-

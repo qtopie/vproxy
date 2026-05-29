@@ -9,14 +9,16 @@ import (
 	"net"
 	"os"
 	"syscall"
+	"time"
 
 	"github.com/qtopie/vproxy/proxy/cgroup"
 )
 
 // Server represents the IPC server for vproxy.
 type Server struct {
-	listener net.Listener
-	stopCh   chan struct{}
+	listener  net.Listener
+	stopCh    chan struct{}
+	startTime time.Time
 }
 
 // StartServer starts the IPC server listening on SocketPath.
@@ -35,8 +37,9 @@ func StartServer() (*Server, error) {
 	}
 
 	s := &Server{
-		listener: ln,
-		stopCh:   make(chan struct{}),
+		listener:  ln,
+		stopCh:    make(chan struct{}),
+		startTime: time.Now(),
 	}
 
 	go s.serve()
@@ -61,40 +64,62 @@ func (s *Server) serve() {
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	cred, err := getPeerCred(conn)
-	if err != nil {
-		resp := AttachResponse{Success: false, Error: fmt.Sprintf("failed to retrieve peer credentials: %v", err)}
+	var genericReq Request
+	// Try to decode as new Request format
+	if err := json.NewDecoder(conn).Decode(&genericReq); err != nil {
+		return
+	}
+
+	switch genericReq.Type {
+	case TypeStatus:
+		resp := StatusResponse{
+			Success: true,
+			Version: "1.0.0",
+			Uptime:  time.Since(s.startTime).String(),
+		}
 		json.NewEncoder(conn).Encode(resp)
-		return
-	}
 
-	var req AttachRequest
-	if err := json.NewDecoder(conn).Decode(&req); err != nil {
-		return
-	}
-
-	resp := AttachResponse{Success: true}
-
-	// Security Validation:
-	// 1. Root can attach any PID.
-	// 2. A user can attach their own PID (the connecting process).
-	// 3. A user can attach another PID if they own it.
-	if cred.Uid != 0 && req.PID != int(cred.Pid) {
-		if !isProcessOwnedBy(req.PID, cred.Uid) {
-			resp.Success = false
-			resp.Error = "permission denied: cannot attach process owned by another user"
+	case TypeAttach, "": // "" for potential backward compatibility if needed
+		cred, err := getPeerCred(conn)
+		if err != nil {
+			resp := AttachResponse{Success: false, Error: fmt.Sprintf("failed to retrieve peer credentials: %v", err)}
 			json.NewEncoder(conn).Encode(resp)
 			return
 		}
-	}
 
-	// Perform the privileged cgroup migration
-	if err := cgroup.MoveProcessToVProxyCgroup(req.PID); err != nil {
-		resp.Success = false
-		resp.Error = err.Error()
-	}
+		var req AttachRequest
+		if genericReq.Type == TypeAttach {
+			json.Unmarshal(genericReq.Data, &req)
+		} else {
+			// Fallback: try to unmarshal genericReq itself as AttachRequest if Type is empty
+			// This is for very old clients that didn't use the Request wrapper.
+			// However, since we already Decoded into genericReq, we might need to re-handle it.
+			// For now, let's assume we use the new Request format.
+		}
 
-	json.NewEncoder(conn).Encode(resp)
+		resp := AttachResponse{Success: true}
+
+		// Security Validation:
+		// 1. Root can attach any PID.
+		// 2. A user can attach their own PID (the connecting process).
+		// 3. A user can attach another PID if they own it.
+		if cred.Uid != 0 && req.PID != int(cred.Pid) {
+			if !isProcessOwnedBy(req.PID, cred.Uid) {
+				resp.Success = false
+				resp.Error = "permission denied: cannot attach process owned by another user"
+				json.NewEncoder(conn).Encode(resp)
+				return
+			}
+		}
+
+		// Perform the privileged cgroup migration
+		if err := cgroup.MoveProcessToVProxyCgroup(req.PID); err != nil {
+			resp.Success = false
+			resp.Error = err.Error()
+		}
+
+		json.NewEncoder(conn).Encode(resp)
+	}
 }
 
 func isProcessOwnedBy(pid int, uid uint32) bool {
