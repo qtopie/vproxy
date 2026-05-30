@@ -16,13 +16,14 @@ import (
 
 // Server represents the IPC server for vproxy.
 type Server struct {
-	listener  net.Listener
-	stopCh    chan struct{}
-	startTime time.Time
+	listener      net.Listener
+	stopCh        chan struct{}
+	startTime     time.Time
+	repairHandler func() error
 }
 
 // StartServer starts the IPC server listening on SocketPath.
-func StartServer() (*Server, error) {
+func StartServer(repairHandler func() error) (*Server, error) {
 	os.Remove(SocketPath) // Ensure socket doesn't already exist
 
 	ln, err := net.Listen("unix", SocketPath)
@@ -37,9 +38,10 @@ func StartServer() (*Server, error) {
 	}
 
 	s := &Server{
-		listener:  ln,
-		stopCh:    make(chan struct{}),
-		startTime: time.Now(),
+		listener:      ln,
+		stopCh:        make(chan struct{}),
+		startTime:     time.Now(),
+		repairHandler: repairHandler,
 	}
 
 	go s.serve()
@@ -76,6 +78,19 @@ func (s *Server) handleConnection(conn net.Conn) {
 			Success: true,
 			Version: "1.0.0",
 			Uptime:  time.Since(s.startTime).String(),
+		}
+		json.NewEncoder(conn).Encode(resp)
+
+	case TypeRepair:
+		resp := AttachResponse{Success: true}
+		if s.repairHandler != nil {
+			if err := s.repairHandler(); err != nil {
+				resp.Success = false
+				resp.Error = err.Error()
+			}
+		} else {
+			resp.Success = false
+			resp.Error = "repair handler not configured"
 		}
 		json.NewEncoder(conn).Encode(resp)
 

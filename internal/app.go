@@ -42,6 +42,91 @@ func RequestStatus() (*ipc.StatusResponse, error) {
 	return ipc.RequestStatus()
 }
 
+// SelfHeal re-verifies and restores the system-wide transparent proxying environment.
+func (a *App) SelfHeal() error {
+	if runtime.GOOS != "linux" || os.Getenv("VP_USE_TUN") == "1" || a.Config.EnableEbpf == nil || !*a.Config.EnableEbpf {
+		return nil
+	}
+
+	Infof("Auditing/Repairing system-wide transparent proxying rules...")
+
+	// 1. Check Permissions
+	if err := ebpf.CheckPermission(); err != nil {
+		return fmt.Errorf("permission check failed: %v", err)
+	}
+
+	// 2. Ensure Cgroup
+	if err := cgroup.EnsureVProxyCgroup(); err != nil {
+		return fmt.Errorf("cgroup setup failed: %v", err)
+	}
+
+	// 3. Determine setup parameters
+	isUpstreamTProxyAlive := false
+	var bestURL *url.URL
+	best := a.getBestUpstream()
+	if best != "" {
+		bestURL, _ = url.Parse(best)
+		if bestURL != nil && bestURL.Scheme == "tproxy" {
+			isUpstreamTProxyAlive = true
+		}
+	}
+
+	setupTarget := fmt.Sprintf("%d", a.ph.TransPort)
+	if isUpstreamTProxyAlive {
+		setupTarget = bestURL.Host
+	}
+
+	isRemoteTProxy := false
+	var upstreamIP net.IP
+	var upstreamPort uint16
+	if isUpstreamTProxyAlive {
+		isRemoteTProxy = true
+		host, portStr, err := net.SplitHostPort(bestURL.Host)
+		if err == nil {
+			upstreamIP = net.ParseIP(host)
+			var p int
+			fmt.Sscanf(portStr, "%d", &p)
+			upstreamPort = uint16(p)
+		}
+	}
+
+	// 4. Setup Redirection
+	const cgroupPath = "/sys/fs/cgroup/vproxy"
+	if ebpf.IsKernelSupported() && os.Getenv("VP_FORCE_IPTABLES") != "1" {
+		r, err := ebpf.Load(cgroupPath, uint16(a.ph.TransPort), 0xff, isRemoteTProxy, upstreamIP, upstreamPort)
+		if err == nil {
+			if a.ebpfResult != nil {
+				a.ebpfResult.Unload()
+			}
+			a.ebpfResult = r
+			a.ph.SetEbpfResult(r)
+			Infof("eBPF redirect active (system-wide)")
+			ebpf.SetEnabled(true)
+			SetDialerControl(ebpf.GetDialerControl())
+			return nil
+		} else {
+			Errorf("eBPF load failed: %v, falling back to iptables", err)
+		}
+	}
+
+	// iptables fallback
+	if err := iptables.SetupRules(setupTarget, isRemoteTProxy, upstreamIP, upstreamPort); err != nil {
+		return fmt.Errorf("iptables setup failed: %v", err)
+	}
+	
+	Infof("iptables redirect active (system-wide)")
+	ebpf.SetEnabled(true)
+	SetDialerControl(ebpf.GetDialerControl())
+	return nil
+}
+
+func (a *App) getBestUpstream() string {
+	if a.ph != nil && a.ph.sm != nil {
+		return a.ph.sm.GetBestServer()
+	}
+	return ""
+}
+
 func (a *App) RunServer() {
 	sm, ph := a.setupServices()
 	a.ph = ph
@@ -64,7 +149,7 @@ func (a *App) RunServer() {
 	}
 
 	// Start IPC Server for unprivileged wrappers to request cgroup migration
-	if srv, err := ipc.StartServer(); err == nil {
+	if srv, err := ipc.StartServer(a.SelfHeal); err == nil {
 		a.ipcServer = srv
 		Infof("IPC server started on %s", ipc.SocketPath)
 	} else {
@@ -92,49 +177,8 @@ func (a *App) RunServer() {
 	}
 
 	// On Linux, if transparent proxy is enabled, we need to setup the global redirection rules
-	if a.Config.EnableEbpf != nil && *a.Config.EnableEbpf && runtime.GOOS == "linux" && os.Getenv("VP_USE_TUN") != "1" {
-		Infof("Setting up system-wide transparent proxying rules (using config: %s)...", a.ConfigPath)
-		
-		setupTarget := fmt.Sprintf("%d", ph.TransPort)
-		if isUpstreamTProxyAlive {
-			setupTarget = bestURL.Host
-		}
-
-		isRemoteTProxy := false
-		var upstreamIP net.IP
-		var upstreamPort uint16
-		if isUpstreamTProxyAlive {
-			isRemoteTProxy = true
-			host, portStr, err := net.SplitHostPort(bestURL.Host)
-			if err == nil {
-				upstreamIP = net.ParseIP(host)
-				var p int
-				fmt.Sscanf(portStr, "%d", &p)
-				upstreamPort = uint16(p)
-			}
-		}
-
-		const cgroupPath = "/sys/fs/cgroup/vproxy"
-		if ebpf.IsKernelSupported() && os.Getenv("VP_FORCE_IPTABLES") != "1" {
-			r, err := ebpf.Load(cgroupPath, uint16(ph.TransPort), 0xff, isRemoteTProxy, upstreamIP, upstreamPort)
-			if err == nil {
-				a.ebpfResult = r
-				ph.SetEbpfResult(r)
-				Infof("eBPF redirect active (system-wide)")
-			} else {
-				Errorf("eBPF load failed: %v, falling back to iptables", err)
-			}
-		}
-		if a.ebpfResult == nil {
-			if err := iptables.SetupRules(setupTarget, isRemoteTProxy, upstreamIP, upstreamPort); err != nil {
-				Errorf("Failed to setup system-wide iptables rules: %v", err)
-			} else {
-				Infof("iptables redirect active (system-wide)")
-			}
-		}
-		
-		ebpf.SetEnabled(true)
-		SetDialerControl(ebpf.GetDialerControl())
+	if err := a.SelfHeal(); err != nil {
+		log.Fatalf("Initialization failed: %v. Please run 'sudo vproxy init' to set up capabilities.", err)
 	}
 
 	a.printVerboseStatus(ph, sm, a.ebpfResult != nil, isUpstreamTProxyAlive, best)
@@ -255,15 +299,28 @@ func (a *App) RunWrapper(args []string) {
 			Debugf("Direct cgroup migration failed (%v), trying IPC attach...", err)
 			if ipcErr := ipc.RequestAttach(os.Getpid()); ipcErr != nil {
 				Debugf("IPC attach failed: %v", ipcErr)
-				if !skipPrivileged && needsEbpf {
-					msg := "vproxy process migration failed! Please initialize the environment by running: 'sudo vproxy init'"
-					fmt.Fprintln(os.Stderr, msg)
-					log.Fatal(msg)
-				} else {
-					// If we failed to move to cgroup, it's not always fatal if skipPrivileged is true (maybe already there)
-					// but for tests it might be an issue.
-					msg := fmt.Sprintf("WARNING: Failed to move %s to vproxy cgroup via direct write or IPC: %v. Transparent proxying might NOT work.", cmdName, ipcErr)
-					Debugf(msg)
+				
+				// TRIGGER SELF-HEAL: If IPC attach fails, the environment might be tampered.
+				// Request the daemon to repair itself.
+				if skipPrivileged {
+					Infof("Environment seems tampered, requesting daemon to self-heal...")
+					if repairErr := ipc.RequestRepair(); repairErr == nil {
+						// Retry attach once after repair
+						ipcErr = ipc.RequestAttach(os.Getpid())
+					}
+				}
+
+				if ipcErr != nil {
+					if !skipPrivileged && needsEbpf {
+						msg := "vproxy process migration failed! Please initialize the environment by running: 'sudo vproxy init'"
+						fmt.Fprintln(os.Stderr, msg)
+						log.Fatal(msg)
+					} else {
+						// If we failed to move to cgroup, it's not always fatal if skipPrivileged is true (maybe already there)
+						// but for tests it might be an issue.
+						msg := fmt.Sprintf("WARNING: Failed to move %s to vproxy cgroup via direct write or IPC: %v. Transparent proxying might NOT work.", cmdName, ipcErr)
+						Debugf(msg)
+					}
 				}
 			} else {
 				Debugf("Successfully moved process %d (%s) to vproxy cgroup via IPC", os.Getpid(), cmdName)
@@ -310,7 +367,7 @@ func (a *App) RunWrapper(args []string) {
 				// If background server is running, we don't need to start a local bridge 
 				// or setup iptables rules here. The background server handles it.
 				Debugf("Background vproxy handles transparent proxying, skipping local bridge/iptables setup")
-				needsEbpf = false // Stop further setup in this wrapper
+				needsEbpf = false 
 			}
 		}
 
@@ -573,23 +630,32 @@ func (a *App) watchConfig(path string, ph *ProxyHandler) {
 
 func (a *App) monitorNetwork(sm *ServerManager) {
 	wasOffline := false
+	healTicker := time.NewTicker(15 * time.Minute)
+	defer healTicker.Stop()
+
 	for {
-		time.Sleep(15 * time.Second)
-		d := net.Dialer{
-			Timeout: 3 * time.Second,
-			Control: GetDialerControl(),
-		}
-		conn, err := d.Dial("tcp", "8.8.8.8:53")
-		if err != nil {
-			wasOffline = true
-			continue
-		}
-		conn.Close()
-		if wasOffline {
-			wasOffline = false
-			servers := sm.GetServers()
-			if len(servers) > 1 {
-				sm.UpdateServers(servers)
+		select {
+		case <-healTicker.C:
+			if err := a.SelfHeal(); err != nil {
+				Errorf("Periodic SelfHeal failed: %v", err)
+			}
+		case <-time.After(15 * time.Second):
+			d := net.Dialer{
+				Timeout: 3 * time.Second,
+				Control: GetDialerControl(),
+			}
+			conn, err := d.Dial("tcp", "8.8.8.8:53")
+			if err != nil {
+				wasOffline = true
+				continue
+			}
+			conn.Close()
+			if wasOffline {
+				wasOffline = false
+				servers := sm.GetServers()
+				if len(servers) > 1 {
+					sm.UpdateServers(servers)
+				}
 			}
 		}
 	}

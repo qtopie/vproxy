@@ -13,7 +13,7 @@ type Server struct {
 }
 
 // StartServer returns a nil server on non-Linux platforms.
-func StartServer() (*Server, error) {
+func StartServer(repairHandler func() error) (*Server, error) {
 	return nil, fmt.Errorf("IPC server is only supported on Linux")
 }
 

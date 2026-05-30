@@ -14,6 +14,7 @@ type RequestType string
 const (
 	TypeAttach RequestType = "attach"
 	TypeStatus RequestType = "status"
+	TypeRepair RequestType = "repair"
 )
 
 type Request struct {
@@ -89,5 +90,33 @@ func RequestStatus() (*StatusResponse, error) {
 	}
 
 	return &resp, nil
+}
+
+// RequestRepair sends a repair request to the background vproxy daemon.
+func RequestRepair() error {
+	conn, err := net.DialTimeout("unix", SocketPath, 500*time.Millisecond)
+	if err != nil {
+		return fmt.Errorf("failed to connect to vproxy daemon (is it running?): %v", err)
+	}
+	defer conn.Close()
+
+	req := Request{
+		Type: TypeRepair,
+	}
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return fmt.Errorf("failed to send repair request: %v", err)
+	}
+
+	var resp AttachResponse // Reuse AttachResponse for simple Success/Error
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second)) // Healing might take a moment
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		return fmt.Errorf("failed to read repair response: %v", err)
+	}
+
+	if !resp.Success {
+		return fmt.Errorf("daemon failed to self-heal: %s", resp.Error)
+	}
+
+	return nil
 }
 
