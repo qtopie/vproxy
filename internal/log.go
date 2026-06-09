@@ -30,6 +30,7 @@ var (
 
 	dialerControl func(network, address string, c syscall.RawConn) error
 	mu            sync.RWMutex
+	logOutput     io.Writer = os.Stderr
 )
 
 // SetDialerControl sets the global dialer control function.
@@ -76,6 +77,9 @@ func SetLevel(l Level) {
 
 // SetOutput sets the output destination for the logger.
 func SetOutput(w io.Writer) {
+	mu.Lock()
+	logOutput = w
+	mu.Unlock()
 	logger.SetOutput(w)
 }
 
@@ -103,6 +107,17 @@ func output(l Level, calldepth int, format string, v ...interface{}) {
 	msg := fmt.Sprintf(prefix+format, v...)
 	// logger.Output expects calldepth; add 1 to account for this wrapper
 	logger.Output(calldepth+1, msg)
+
+	mu.RLock()
+	out := logOutput
+	mu.RUnlock()
+
+	// If output is redirected (not os.Stderr) and we have an error or fatal,
+	// print to os.Stderr too so the user sees the error.
+	if out != os.Stderr && l >= LevelError {
+		fmt.Fprintf(os.Stderr, "vproxy: %s\n", msg)
+	}
+
 	if l == LevelFatal {
 		os.Exit(1)
 	}
@@ -122,6 +137,21 @@ func Errorf(format string, v ...interface{}) { output(LevelError, 2, format, v..
 
 // Fatalf prints fatal-level logs and exits.
 func Fatalf(format string, v ...interface{}) { output(LevelFatal, 2, format, v...) }
+
+// Debug prints debug-level logs.
+func Debug(v ...interface{}) { output(LevelDebug, 2, fmt.Sprint(v...)) }
+
+// Info prints info-level logs.
+func Info(v ...interface{}) { output(LevelInfo, 2, fmt.Sprint(v...)) }
+
+// Warn prints warning-level logs.
+func Warn(v ...interface{}) { output(LevelWarn, 2, fmt.Sprint(v...)) }
+
+// Error prints error-level logs.
+func Error(v ...interface{}) { output(LevelError, 2, fmt.Sprint(v...)) }
+
+// Fatal prints fatal-level logs and exits.
+func Fatal(v ...interface{}) { output(LevelFatal, 2, fmt.Sprint(v...)) }
 
 type logHelper struct {
 	prefix string

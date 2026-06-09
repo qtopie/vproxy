@@ -16,6 +16,9 @@ func main() {
 	client := &http.Client{
 		Transport: transport,
 		Timeout:   10 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 
 	req, err := http.NewRequest("GET", "https://cn.bing.com/", nil)

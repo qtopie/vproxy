@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -78,7 +77,7 @@ func main() {
 
 	case "clean":
 		if os.Geteuid() != 0 {
-			log.Fatal("'clean' command requires sudo privileges")
+			vlink.Fatal("'clean' command requires sudo privileges")
 		}
 		stopBackgroundServer()
 		vlink.SetVerbose(*verbose)
@@ -93,13 +92,13 @@ func main() {
 
 	case "init":
 		if os.Geteuid() != 0 {
-			log.Fatal("'init' command requires sudo privileges")
+			vlink.Fatal("'init' command requires sudo privileges")
 		}
 
 		// Fail fast: verify configuration exists and is valid before starting daemon
 		_, resolvedPath, err := vlink.LoadConfig(*configPath)
 		if err != nil {
-			log.Fatalf("init failed: %v", err)
+			vlink.Fatalf("init failed: %v", err)
 		}
 
 		binary, err := os.Executable()
@@ -123,7 +122,7 @@ func main() {
 	case "start":
 		cfg, finalPath, err := vlink.LoadConfig(*configPath)
 		if err != nil {
-			log.Fatalf("Failed to load config: %v", err)
+			vlink.Fatalf("Failed to load config: %v", err)
 		}
 		vproxy := &vlink.App{
 			Config:     cfg,
@@ -139,7 +138,7 @@ func main() {
 	// Not a built-in subcommand, treat as a wrapper: vproxy curl ...
 	cfg, finalPath, err := vlink.LoadConfig(*configPath)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		vlink.Fatalf("Failed to load config: %v", err)
 	}
 
 	isVerbose := (verbose != nil && *verbose) || os.Getenv("VP_VERBOSE") == "1"
@@ -194,7 +193,7 @@ func printUsage() {
 func startBackgroundServer(config string) {
 	// Check if already running
 	if _, err := os.Stat(pidFile); err == nil {
-		fmt.Println("vproxy is already running. Run 'vproxy clean' first if you want to restart.")
+		fmt.Fprintln(os.Stderr, "vproxy is already running. Run 'vproxy clean' first if you want to restart.")
 		return
 	}
 
@@ -218,12 +217,12 @@ func startBackgroundServer(config string) {
 	
 	err := cmd.Start()
 	if err != nil {
-		log.Fatalf("Failed to start background server: %v", err)
+		vlink.Fatalf("Failed to start background server: %v", err)
 	}
 
 	os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", cmd.Process.Pid)), 0644)
-	fmt.Printf("vproxy: started in background (PID: %d, Log: %s)\n", cmd.Process.Pid, logFile)
-	fmt.Println("vproxy: TUN environment initialized.")
+	fmt.Fprintf(os.Stderr, "vproxy: started in background (PID: %d, Log: %s)\n", cmd.Process.Pid, logFile)
+	fmt.Fprintln(os.Stderr, "vproxy: TUN environment initialized.")
 }
 
 func stopBackgroundServer() {
@@ -255,6 +254,6 @@ func ensureProcessInConfig(path string, cfg *vlink.Config, proc string) {
 		// Save back to config
 		data, _ := json.MarshalIndent(cfg, "", "  ")
 		os.WriteFile(path, data, 0644)
-		fmt.Printf("vproxy: added '%s' to proxy rules\n", proc)
+		fmt.Fprintf(os.Stderr, "vproxy: added '%s' to proxy rules\n", proc)
 	}
 }
