@@ -205,13 +205,14 @@ func StartLinuxTransparent(ctx context.Context, tcpHandler func(net.Conn), udpHa
 		return fmt.Errorf("failed to create fdbased link endpoint: %v", err)
 	}
 
-	if tcpipErr := s.CreateNIC(1, linkEP); tcpipErr != nil {
+	if tcpipErr := s.CreateNIC(1, &icmpInterceptor{LinkEndpoint: linkEP, dev: dev}); tcpipErr != nil {
 		dev.Close()
 		return fmt.Errorf("failed to create NIC: %v", tcpipErr)
 	}
 
 	// Enable promiscuous mode and forwarding to intercept all packets
 	s.SetPromiscuousMode(1, true)
+	s.SetSpoofing(1, true)
 	s.SetForwardingDefaultAndAllNICs(ipv4.ProtocolNumber, true)
 	s.SetForwardingDefaultAndAllNICs(ipv6.ProtocolNumber, true)
 
@@ -363,4 +364,31 @@ func GetProcessNameByPort(_ int) (string, error) {
 // GetProcessNameByConn is not implemented on Linux.
 func GetProcessNameByConn(_ interface{}) (string, error) {
 	return "", fmt.Errorf("GetProcessNameByConn not implemented on Linux")
+}
+
+type icmpInterceptor struct {
+	stack.LinkEndpoint
+	dev tun.Device
+}
+
+func (i *icmpInterceptor) Attach(d stack.NetworkDispatcher) {
+	i.LinkEndpoint.Attach(&icmpDispatcher{NetworkDispatcher: d, dev: i.dev})
+}
+
+type icmpDispatcher struct {
+	stack.NetworkDispatcher
+	dev tun.Device
+}
+
+func (d *icmpDispatcher) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+	// Gvisor calls this to deliver a packet from the link (TUN) to the stack.
+	// We can intercept here to handle ICMP echo requests locally.
+	view := pkt.ToView()
+	pktBuf := view.AsSlice()
+	if CheckAndWriteICMP(d.dev, pktBuf, 0) {
+		view.Release()
+		return
+	}
+	view.Release()
+	d.NetworkDispatcher.DeliverNetworkPacket(protocol, pkt)
 }

@@ -7,11 +7,11 @@ clean:
 	rm -rf bin/vproxy bin/test_*
 
 build-tests:
-	go build -o bin/test_direct ./cmd/test/direct
-	go build -o bin/test_upstream ./cmd/test/upstream
-	go build -o bin/test_ebpf ./cmd/test/ebpf
-	go build -o bin/test_tproxy ./cmd/test/tproxy
-	go build -o bin/test_google ./cmd/test/google
+	go build -o bin/test_direct ./tests/direct
+	go build -o bin/test_upstream ./tests/upstream
+	go build -o bin/test_ebpf ./tests/ebpf
+	go build -o bin/test_tproxy ./tests/tproxy
+	go build -o bin/test_google ./tests/google
 
 test-network: build-tests
 	@echo "=========================================="

@@ -6,6 +6,7 @@ package tproxy
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 	"syscall"
 	"unsafe"
 
+	"github.com/qtopie/vproxy/internal/dns"
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/tun"
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -103,6 +105,11 @@ func StartWindowsTransparent(ctx context.Context, tcpHandler func(net.Conn), udp
 		return nil // already running
 	}
 
+	// 0. Initialize Fake-IP Pool
+	if err := dns.InitGlobalPool("198.18.0.0/15"); err != nil {
+		return fmt.Errorf("failed to init Fake-IP pool: %v", err)
+	}
+
 	// 1. Create TUN device backed by the Wintun kernel driver.
 	dev, err := tun.CreateTUN("vproxy-tun", 1500)
 	if err != nil {
@@ -124,6 +131,11 @@ func StartWindowsTransparent(ctx context.Context, tcpHandler func(net.Conn), udp
 	if tcpipErr := s.CreateNIC(1, chanEP); tcpipErr != nil {
 		return fmt.Errorf("CreateNIC: %v", tcpipErr)
 	}
+
+	s.SetPromiscuousMode(1, true)
+	s.SetSpoofing(1, true)
+	s.SetForwardingDefaultAndAllNICs(ipv4.ProtocolNumber, true)
+	s.SetForwardingDefaultAndAllNICs(ipv6.ProtocolNumber, true)
 
 	// Assign an IP address so gvisor accepts inbound packets.
 	tunIP := [4]byte{198, 18, 0, 1}
@@ -167,6 +179,37 @@ func StartWindowsTransparent(ctx context.Context, tcpHandler func(net.Conn), udp
 		ep := r.ID()
 		target := fmt.Sprintf("%s:%d", ep.LocalAddress, ep.LocalPort)
 
+		// Intercept DNS (port 53)
+		if ep.LocalPort == 53 {
+			var wq waiter.Queue
+			endpoint, tcpipErr := r.CreateEndpoint(&wq)
+			if tcpipErr != nil {
+				return false
+			}
+			go func() {
+				conn := gonet.NewUDPConn(&wq, endpoint)
+				defer conn.Close()
+				for {
+					buf := make([]byte, 1024)
+					n, remoteAddr, err := conn.ReadFrom(buf)
+					if err != nil {
+						if err != io.EOF {
+							log.Printf("[TUN/W] DNS Read error: %v", err)
+						}
+						return
+					}
+					resp, domain, err := dns.HandleDNSQuery(buf[:n])
+					if err != nil {
+						log.Printf("[TUN/W] DNS Handle error for %s: %v", domain, err)
+						continue
+					}
+					log.Printf("[TUN/W] DNS Hijacked: %s -> Fake-IP", domain)
+					conn.WriteTo(resp, remoteAddr)
+				}
+			}()
+			return true
+		}
+
 		var wq waiter.Queue
 		endpoint, tcpipErr := r.CreateEndpoint(&wq)
 		if tcpipErr != nil {
@@ -200,11 +243,19 @@ func bridgeTunWindows(dev tun.Device, ep *channel.Endpoint) {
 				if sizes[i] <= 0 {
 					continue
 				}
+
+				pktBuf := pkt[offset : offset+sizes[i]]
+
+				// Handle ICMP Echo Requests locally to prevent "network broken" feel
+				if CheckAndWriteICMP(dev, pktBuf, offset) {
+					continue
+				}
+
 				pb := stack.NewPacketBuffer(stack.PacketBufferOptions{
-					Payload: buffer.MakeWithData(pkt[offset : offset+sizes[i]]),
+					Payload: buffer.MakeWithData(pktBuf),
 				})
 				proto := tcpip.NetworkProtocolNumber(ipv4.ProtocolNumber)
-				if sizes[i] > 0 && (pkt[offset]>>4) == 6 {
+				if (pktBuf[0] >> 4) == 6 {
 					proto = ipv6.ProtocolNumber
 				}
 				ep.InjectInbound(proto, pb)

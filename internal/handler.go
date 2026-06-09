@@ -22,6 +22,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/qtopie/vproxy/internal/dns"
 	"github.com/qtopie/vproxy/internal/mitm"
 	"github.com/qtopie/vproxy/proxy/ebpf"
 	"github.com/qtopie/vproxy/proxy/tproxy"
@@ -197,6 +198,21 @@ func (ph *ProxyHandler) StartTransparent() error {
 }
 
 func (ph *ProxyHandler) handleUDP(ctx context.Context, local net.Conn, target string) {
+	// Restore domain from Fake-IP if necessary
+	if dns.GlobalPool != nil {
+		host, port, err := net.SplitHostPort(target)
+		if err == nil {
+			ip := net.ParseIP(host)
+			if ip != nil && dns.GlobalPool.IsFakeIP(ip) {
+				domain := dns.GlobalPool.GetDomain(ip)
+				if domain != "" {
+					target = net.JoinHostPort(domain, port)
+					log.Printf("[TUN] Restored UDP Fake-IP %s -> %s", host, domain)
+				}
+			}
+		}
+	}
+
 	defer local.Close()
 	process := ""
 	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
@@ -790,6 +806,21 @@ func (ph *ProxyHandler) dialTargetUDP(target string, process string) (net.Conn, 
 }
 
 func (ph *ProxyHandler) forward(conn net.Conn, target string) {
+	// Restore domain from Fake-IP if necessary
+	if dns.GlobalPool != nil {
+		host, port, err := net.SplitHostPort(target)
+		if err == nil {
+			ip := net.ParseIP(host)
+			if ip != nil && dns.GlobalPool.IsFakeIP(ip) {
+				domain := dns.GlobalPool.GetDomain(ip)
+				if domain != "" {
+					target = net.JoinHostPort(domain, port)
+					log.Printf("[TUN] Restored Fake-IP %s -> %s", host, domain)
+				}
+			}
+		}
+	}
+
 	process := ""
 	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
 		process, _ = tproxy.GetProcessNameByConn(conn)
