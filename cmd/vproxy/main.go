@@ -136,15 +136,9 @@ func main() {
 	}
 
 	// Not a built-in subcommand, treat as a wrapper: vproxy curl ...
-	cfg, finalPath, err := vlink.LoadConfig(*configPath)
-	if err != nil {
-		vlink.Fatalf("Failed to load config: %v", err)
-	}
-
 	isVerbose := (verbose != nil && *verbose) || os.Getenv("VP_VERBOSE") == "1"
 	if isVerbose {
 		vlink.SetVerbose(true)
-		vlink.Debugf("Verbose mode enabled (VP_VERBOSE=1 or -v)")
 	}
 
 	// Redirect logs to a file to keep console clean for the wrapped command
@@ -152,9 +146,18 @@ func main() {
 	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err == nil {
 		vlink.SetOutput(f)
-		fmt.Fprintf(os.Stderr, "vproxy: logging to %s\n", logPath)
+		vlink.Infof("vproxy: logging to %s", logPath)
 	} else {
 		fmt.Fprintf(os.Stderr, "vproxy: failed to open log file %s: %v\n", logPath, err)
+	}
+
+	if isVerbose {
+		vlink.Debugf("Verbose mode enabled (VP_VERBOSE=1 or -v)")
+	}
+
+	cfg, finalPath, err := vlink.LoadConfig(*configPath)
+	if err != nil {
+		vlink.Fatalf("Failed to load config: %v", err)
 	}
 
 	vproxy := &vlink.App{
@@ -254,6 +257,6 @@ func ensureProcessInConfig(path string, cfg *vlink.Config, proc string) {
 		// Save back to config
 		data, _ := json.MarshalIndent(cfg, "", "  ")
 		os.WriteFile(path, data, 0644)
-		fmt.Fprintf(os.Stderr, "vproxy: added '%s' to proxy rules\n", proc)
+		vlink.Infof("vproxy: added '%s' to proxy rules", proc)
 	}
 }

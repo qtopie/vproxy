@@ -138,12 +138,10 @@ func (a *App) RunServer() {
 
 	if err := ph.StartSocks(); err != nil {
 		msg := fmt.Sprintf("Failed to start SOCKS5 proxy: %v", err)
-		fmt.Fprintln(os.Stderr, msg)
 		Fatal(msg)
 	}
 	if err := ph.StartHTTP(); err != nil {
 		msg := fmt.Sprintf("Failed to start HTTP proxy: %v", err)
-		fmt.Fprintln(os.Stderr, msg)
 		Fatal(msg)
 	}
 
@@ -168,7 +166,6 @@ func (a *App) RunServer() {
 	if !isUpstreamTProxyAlive {
 		if err := ph.StartTransparent(); err != nil {
 			msg := fmt.Sprintf("Failed to start transparent proxy: %v", err)
-			fmt.Fprintln(os.Stderr, msg)
 			Fatal(msg)
 		}
 	} else {
@@ -312,7 +309,6 @@ func (a *App) RunWrapper(args []string) {
 				if ipcErr != nil {
 					if !skipPrivileged && needsEbpf {
 						msg := "vproxy process migration failed! Please initialize the environment by running: 'sudo vproxy init'"
-						fmt.Fprintln(os.Stderr, msg)
 						Fatal(msg)
 					} else {
 						// If we failed to move to cgroup, it's not always fatal if skipPrivileged is true (maybe already there)
@@ -338,14 +334,12 @@ func (a *App) RunWrapper(args []string) {
 		if !skipPrivileged {
 			if err := ebpf.CheckPermission(); err != nil && !isTUN {
 				msg := "vproxy permission check failed! Please initialize the environment by running: 'sudo vproxy init'"
-				fmt.Fprintln(os.Stderr, msg)
 				Fatal(msg)
 			}
 
 			// Ensure cgroup exists (already moved to it above, but ensure directory exists)
 			if err := cgroup.EnsureVProxyCgroup(); err != nil && !isTUN {
 				msg := "vproxy permission check failed! Please initialize the environment by running: 'sudo vproxy init'"
-				fmt.Fprintln(os.Stderr, msg)
 				Fatal(msg)
 			}
 		}
@@ -359,7 +353,7 @@ func (a *App) RunWrapper(args []string) {
 			if !skipPrivileged {
 				if err := ph.StartTransparent(); err != nil {
 					msg := fmt.Sprintf("Failed to start transparent bridge: %v", err)
-					fmt.Fprintln(os.Stderr, msg)
+					Errorf(msg)
 				}
 				setupTarget = fmt.Sprintf("%d", ph.TransPort)
 			} else {
@@ -404,7 +398,6 @@ func (a *App) RunWrapper(args []string) {
 				// iptables fallback.
 				if err := iptables.SetupRules(setupTarget, isRemoteTProxy, upstreamIP, upstreamPort); err != nil {
 					msg := fmt.Sprintf("Fatal: iptables setup failed: %v", err)
-					fmt.Fprintln(os.Stderr, msg)
 					Fatal(msg)
 				}
 				Debugf("iptables redirect active (IPv4 TCP+UDP only)")
@@ -481,7 +474,6 @@ func (a *App) RunWrapper(args []string) {
 		} else {
 			if err := ph.StartHTTP(); err != nil {
 				msg := fmt.Sprintf("Failed to start local HTTP bridge: %v", err)
-				fmt.Fprintln(os.Stderr, msg)
 				Fatal(msg)
 			}
 			finalHTTPProxy = fmt.Sprintf("http://127.0.0.1:%d", ph.HttpPort)
@@ -496,7 +488,6 @@ func (a *App) RunWrapper(args []string) {
 			} else {
 				if err := ph.StartSocks(); err != nil {
 					msg := fmt.Sprintf("Failed to start local SOCKS5 bridge: %v", err)
-					fmt.Fprintln(os.Stderr, msg)
 					Fatal(msg)
 				}
 				finalSocksProxy = fmt.Sprintf("socks5://127.0.0.1:%d", ph.SocksPort)
@@ -559,7 +550,7 @@ func (a *App) PrintConnectivityOK() {
 	if a.checkColorSupport() {
 		ok = "\033[32mOK\033[0m"
 	}
-	fmt.Fprintf(os.Stderr, "vproxy connectivity: %s\n", ok)
+	Infof("vproxy connectivity: %s", ok)
 }
 
 func (a *App) checkColorSupport() bool {
