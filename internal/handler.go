@@ -35,6 +35,7 @@ type ProxyHandler struct {
 	SocksPort      int
 	HttpPort       int
 	TransPort      int
+	WebPort        int
 	DialTimeout    time.Duration
 	DialRetryCount int
 	socksLn        net.Listener
@@ -52,13 +53,14 @@ func (ph *ProxyHandler) SetEbpfResult(r *ebpf.LoadResult) {
 
 // NewProxyHandler constructs a ProxyHandler. Exported to allow callers in other packages
 // to create the handler without accessing internal fields directly.
-func NewProxyHandler(sm *ServerManager, rm *RuleManager, socksPort, httpPort, transPort int) *ProxyHandler {
+func NewProxyHandler(sm *ServerManager, rm *RuleManager, socksPort, httpPort, transPort, webPort int) *ProxyHandler {
 	return &ProxyHandler{
 		sm:             sm,
 		rm:             rm,
 		SocksPort:      socksPort,
 		HttpPort:       httpPort,
 		TransPort:      transPort,
+		WebPort:        webPort,
 		DialTimeout:    5000 * time.Millisecond, // Default 5 seconds
 		DialRetryCount: 3,                       // Default 3 attempts
 	}
@@ -119,7 +121,7 @@ func (ph *ProxyHandler) StartTransparent() error {
 	if runtime.GOOS == "darwin" {
 		SetDialerControl(tproxy.GetDialerControl())
 		go func() {
-			err := tproxy.StartDarwinTransparent(context.Background(), func(conn net.Conn) {
+			err := tproxy.StartDarwinTransparent(context.Background(), ph.HttpPort, ph.SocksPort, ph.WebPort, func(conn net.Conn) {
 				defer conn.Close()
 				target, err := tproxy.GetOriginalDst(conn)
 				if err != nil {
@@ -215,10 +217,11 @@ func (ph *ProxyHandler) handleUDP(ctx context.Context, local net.Conn, target st
 
 	defer local.Close()
 	process := ""
+	pid := 0
 	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
-		process, _ = tproxy.GetProcessNameByConn(local)
+		process, pid, _ = tproxy.GetProcessNameByConn(local)
 	}
-	upstream, err := ph.dialTargetUDP(target, process)
+	upstream, err := ph.dialTargetUDP(target, process, pid)
 	if err != nil {
 		Errorf("[UDP] Failed to dial upstream for %s: %v", target, err)
 		return
@@ -272,7 +275,7 @@ func (ph *ProxyHandler) serveSocks() {
 			ctx = context.WithValue(ctx, startTimeKey{}, time.Now())
 			TraceInfof(ctx, "[SOCKS5] Accepted connection from %s targeting %s", conn.RemoteAddr(), tgt.String())
 
-			rc, err := ph.dialTarget(tgt.String(), "")
+			rc, err := ph.dialTarget(tgt.String(), "", 0)
 			if err != nil {
 				TraceErrorf(ctx, "[SOCKS5] Failed to connect to target %s: %v", tgt.String(), err)
 				socks.WriteReply(conn, socks.ErrConnectionRefused, nil)
@@ -353,11 +356,12 @@ func (ph *ProxyHandler) serveTransparentUDP() {
 		var upstream net.Conn
 		if !loaded {
 			process := ""
+			pid := 0
 			if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
-				process, _ = tproxy.GetProcessNameByPort(src.Port)
+				process, pid, _ = tproxy.GetProcessNameByPort(src.Port)
 			}
-			Infof("[UDP] Intercepted new UDP session from %s (Process: %s) targeting %s", src.String(), process, dst.String())
-			upstream, err = ph.dialTargetUDP(dst.String(), process)
+			Infof("[UDP] Intercepted new UDP session from %s (Process: %s, PID: %d) targeting %s", src.String(), process, pid, dst.String())
+			upstream, err = ph.dialTargetUDP(dst.String(), process, pid)
 			if err != nil {
 				Errorf("[UDP] Failed to dial upstream UDP for %s: %v", dst.String(), err)
 				continue
@@ -433,8 +437,9 @@ func (ph *ProxyHandler) serveHTTP() {
 			}
 
 			process := ""
+			pid := 0
 			if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
-				process, _ = tproxy.GetProcessNameByConn(conn)
+				process, pid, _ = tproxy.GetProcessNameByConn(conn)
 			}
 
 			// Check if we should intercept this connection (MITM)
@@ -442,12 +447,12 @@ func (ph *ProxyHandler) serveHTTP() {
 			if h, _, err := net.SplitHostPort(req.Host); err == nil {
 				hostOnly = h
 			}
-			action, _ := ph.rm.MatchContext(MatchContext{Host: hostOnly, Process: process})
+			action, _ := ph.rm.MatchContext(MatchContext{Host: hostOnly, Process: process, PID: pid})
 
-			// Deep HTTPS Tracing (MITM) when verbose mode is on OR explicitly intercepted/mapped
-			if IsVerbose() || action == ActionIntercept || action == ActionMap {
+			// Deep HTTPS Tracing (MITM) when explicitly intercepted/mapped
+			if action == ActionIntercept || action == ActionMap {
 				// Establish TLS connection with the target server
-				serverTLS, err := ph.dialTargetTLS(req.Host, process)
+				serverTLS, err := ph.dialTargetTLS(req.Host, process, pid)
 				if err != nil {
 					log.Printf("MITM: failed to dial target TLS %s: %v", req.Host, err)
 					res := http.Response{StatusCode: http.StatusBadGateway, ProtoMajor: 1, ProtoMinor: 1}
@@ -644,8 +649,8 @@ func (ph *ProxyHandler) serveLocalFile(conn net.Conn, path string) {
 	res.Write(conn)
 }
 
-func (ph *ProxyHandler) dialTargetTLS(target string, process string) (*tls.Conn, error) {
-	conn, err := ph.dialTarget(target, process)
+func (ph *ProxyHandler) dialTargetTLS(target string, process string, pid int) (*tls.Conn, error) {
+	conn, err := ph.dialTarget(target, process, pid)
 	if err != nil {
 		return nil, err
 	}
@@ -670,10 +675,10 @@ func (ph *ProxyHandler) dialTargetTLS(target string, process string) (*tls.Conn,
 	return tlsConn, nil
 }
 
-func (ph *ProxyHandler) dialTarget(target string, process string) (net.Conn, error) {
+func (ph *ProxyHandler) dialTarget(target string, process string, pid int) (net.Conn, error) {
 	host, portStr, _ := net.SplitHostPort(target)
 	port, _ := strconv.Atoi(portStr)
-	action, _ := ph.rm.MatchContext(MatchContext{Host: host, Port: port, Process: process})
+	action, _ := ph.rm.MatchContext(MatchContext{Host: host, Port: port, Process: process, PID: pid})
 	if action == ActionDirect {
 		Debugf("[Dial] Target %s matches DIRECT rule, dialing directly", target)
 		return ph.dialDirect(target)
@@ -737,10 +742,10 @@ func (ph *ProxyHandler) dialTarget(target string, process string) (net.Conn, err
 	return nil, fmt.Errorf("all TCP dial attempts failed, last error: %w", lastErr)
 }
 
-func (ph *ProxyHandler) dialTargetUDP(target string, process string) (net.Conn, error) {
+func (ph *ProxyHandler) dialTargetUDP(target string, process string, pid int) (net.Conn, error) {
 	host, portStr, _ := net.SplitHostPort(target)
 	port, _ := strconv.Atoi(portStr)
-	
+
 	dialTimeout := ph.DialTimeout
 	if dialTimeout <= 0 {
 		dialTimeout = 5 * time.Second
@@ -750,7 +755,7 @@ func (ph *ProxyHandler) dialTargetUDP(target string, process string) (net.Conn, 
 		dialRetryCount = 3
 	}
 
-	action, _ := ph.rm.MatchContext(MatchContext{Host: host, Port: port, Process: process})
+	action, _ := ph.rm.MatchContext(MatchContext{Host: host, Port: port, Process: process, PID: pid})
 	if action == ActionDirect {
 		// Just dial directly for UDP bypassing proxy
 
@@ -822,8 +827,9 @@ func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 	}
 
 	process := ""
+	pid := 0
 	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
-		process, _ = tproxy.GetProcessNameByConn(conn)
+		process, pid, _ = tproxy.GetProcessNameByConn(conn)
 	}
 
 	traceID := fmt.Sprintf("conn-%04d", atomic.AddUint64(&traceCounter, 1))
@@ -831,7 +837,7 @@ func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 	ctx = context.WithValue(ctx, startTimeKey{}, time.Now())
 
 	if process != "" {
-		TraceInfof(ctx, "Accepted connection from %s (Process: %s) targeting %s", conn.RemoteAddr(), process, target)
+		TraceInfof(ctx, "Accepted connection from %s (Process: %s, PID: %d) targeting %s", conn.RemoteAddr(), process, pid, target)
 	} else {
 		TraceInfof(ctx, "Accepted connection from %s targeting %s", conn.RemoteAddr(), target)
 	}
@@ -843,7 +849,7 @@ func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 		return
 	}
 
-	rc, err := ph.dialTarget(target, process)
+	rc, err := ph.dialTarget(target, process, pid)
 	if err != nil {
 		TraceErrorf(ctx, "Failed to connect to target %s: %v", target, err)
 		return

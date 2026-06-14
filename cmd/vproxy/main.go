@@ -25,13 +25,11 @@ var (
 	useTun     = flag.Bool("tun", false, "enable TUN mode (Linux only)")
 )
 
-var (
-	pidFile = filepath.Join(os.TempDir(), "vproxy.pid")
-)
-
 func main() {
 	flag.Parse()
 	args := flag.Args()
+
+	pidFile := vlink.GetPIDFilePath()
 
 	if *verbose {
 		vlink.SetVerbose(true)
@@ -116,7 +114,7 @@ func main() {
 			exec.Command("chown", "-R", sudoUser, "/sys/fs/cgroup/vproxy").Run()
 		}
 
-		startBackgroundServer(resolvedPath)
+		startBackgroundServer(resolvedPath, pidFile)
 		return
 
 	case "start":
@@ -141,14 +139,17 @@ func main() {
 		vlink.SetVerbose(true)
 	}
 
-	// Redirect logs to a file to keep console clean for the wrapped command
-	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("vproxy-%d.log", os.Getpid()))
-	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err == nil {
-		vlink.SetOutput(f)
-		vlink.Infof("vproxy: logging to %s", logPath)
-	} else {
-		fmt.Fprintf(os.Stderr, "vproxy: failed to open log file %s: %v\n", logPath, err)
+	// Redirect logs to a file to keep console clean for the wrapped command,
+	// unless verbose mode is requested.
+	if !isVerbose {
+		logPath := filepath.Join(os.TempDir(), fmt.Sprintf("vproxy-%d.log", os.Getpid()))
+		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err == nil {
+			vlink.SetOutput(f)
+			vlink.Infof("vproxy: logging to %s", logPath)
+		} else {
+			fmt.Fprintf(os.Stderr, "vproxy: failed to open log file %s: %v\n", logPath, err)
+		}
 	}
 
 	if isVerbose {
@@ -193,7 +194,7 @@ func printUsage() {
 	flag.PrintDefaults()
 }
 
-func startBackgroundServer(config string) {
+func startBackgroundServer(config, pidFile string) {
 	// Check if already running
 	if _, err := os.Stat(pidFile); err == nil {
 		fmt.Fprintln(os.Stderr, "vproxy is already running. Run 'vproxy clean' first if you want to restart.")
@@ -229,6 +230,7 @@ func startBackgroundServer(config string) {
 }
 
 func stopBackgroundServer() {
+	pidFile := vlink.GetPIDFilePath()
 	data, err := os.ReadFile(pidFile)
 	if err != nil {
 		return
@@ -253,10 +255,11 @@ func ensureProcessInConfig(path string, cfg *vlink.Config, proc string) {
 		}
 	}
 	if !exists {
-		cfg.Rules = append(cfg.Rules, rule)
+		// Prepend the rule to ensure it has the highest priority
+		cfg.Rules = append([]string{rule}, cfg.Rules...)
 		// Save back to config
 		data, _ := json.MarshalIndent(cfg, "", "  ")
 		os.WriteFile(path, data, 0644)
-		vlink.Infof("vproxy: added '%s' to proxy rules", proc)
+		vlink.Infof("vproxy: added '%s' to proxy rules (priority: high)", proc)
 	}
 }

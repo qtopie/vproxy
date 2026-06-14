@@ -1,9 +1,11 @@
 package internal
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"strings"
+	"sync"
 )
 
 // RuleAction defines the action to take for a matched rule.
@@ -42,12 +44,14 @@ const (
 	RuleTypeDomain RuleType = iota
 	RuleTypeProcess
 	RuleTypeURL
+	RuleTypePID
 )
 
 // Rule represents a single routing rule.
 type Rule struct {
 	Type    RuleType
 	Pattern string
+	PID     int // Used for RuleTypePID
 	Action  RuleAction
 	Target  string // Used for ActionMap (e.g., file:///path or http://url)
 }
@@ -60,6 +64,7 @@ type MatchContext struct {
 	Host    string
 	Port    int
 	Process string // full executable path on macOS, command name elsewhere
+	PID     int    // Process ID
 	URL     string // Full URL for HTTP mapping
 }
 
@@ -68,6 +73,19 @@ type RuleManager struct {
 	rules         []Rule
 	defaultAction RuleAction
 	directDNS     bool
+	mu            sync.RWMutex
+}
+
+// AddPIDRule adds a high-priority PID rule to the manager at runtime.
+func (rm *RuleManager) AddPIDRule(pid int, action RuleAction) {
+	if rm == nil {
+		return
+	}
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	// Prepend to ensure highest priority
+	rm.rules = append([]Rule{{Type: RuleTypePID, PID: pid, Action: action}}, rm.rules...)
 }
 
 // NewRuleManager creates a new RuleManager from a list of rules.
@@ -94,6 +112,7 @@ func NewRuleManager(ruleEntries []string) *RuleManager {
 
 		var ruleType RuleType = RuleTypeDomain
 		var pattern, actionStr, target string
+		var action RuleAction
 
 		p0 := strings.ToUpper(strings.TrimSpace(parts[0]))
 		if p0 == "MAP" && len(parts) >= 3 {
@@ -108,24 +127,11 @@ func NewRuleManager(ruleEntries []string) *RuleManager {
 		} else if len(parts) == 3 {
 			pattern = strings.TrimSpace(parts[1])
 			actionStr = strings.ToUpper(strings.TrimSpace(parts[2]))
-
-			switch p0 {
-			case "DOMAIN":
-				ruleType = RuleTypeDomain
-			case "PROCESS":
-				ruleType = RuleTypeProcess
-			case "URL":
-				ruleType = RuleTypeURL
-			default:
-				log.Printf("Router: Unknown rule type '%s'. Skipping.", p0)
-				continue
-			}
 		} else {
 			pattern = strings.TrimSpace(parts[0])
 			actionStr = strings.ToUpper(strings.TrimSpace(parts[1]))
 		}
 
-		var action RuleAction
 		switch actionStr {
 		case "DIRECT":
 			action = ActionDirect
@@ -138,6 +144,26 @@ func NewRuleManager(ruleEntries []string) *RuleManager {
 		default:
 			log.Printf("Router: Unknown action '%s' in rule '%s'. Skipping.", actionStr, entry)
 			continue
+		}
+
+		if p0 == "PID" {
+			ruleType = RuleTypePID
+			var pid int
+			fmt.Sscanf(pattern, "%d", &pid)
+			rm.rules = append(rm.rules, Rule{Type: ruleType, PID: pid, Action: action, Target: target})
+			continue
+		}
+
+		switch p0 {
+		case "DOMAIN":
+			ruleType = RuleTypeDomain
+		case "PROCESS":
+			ruleType = RuleTypeProcess
+		case "URL":
+			ruleType = RuleTypeURL
+		default:
+			// Fallback to domain if it's not a known type
+			ruleType = RuleTypeDomain
 		}
 
 		if strings.ToUpper(pattern) == "DEFAULT" || strings.ToUpper(pattern) == "FINAL" {
@@ -175,6 +201,9 @@ func (rm *RuleManager) MatchContext(ctx MatchContext) (RuleAction, string) {
 }
 
 func (rm *RuleManager) doMatchContext(ctx MatchContext) (RuleAction, string) {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+
 	// 0. Always direct for DNS to avoid UDP relay issues with some upstreams
 	if rm.directDNS && ctx.Port == 53 {
 		return ActionDirect, ""
@@ -195,6 +224,10 @@ func (rm *RuleManager) doMatchContext(ctx MatchContext) (RuleAction, string) {
 	// 3. Process user-defined rules
 	for _, rule := range rm.rules {
 		switch rule.Type {
+		case RuleTypePID:
+			if ctx.PID != 0 && ctx.PID == rule.PID {
+				return rule.Action, rule.Target
+			}
 		case RuleTypeProcess:
 			if ctx.Process != "" && (ctx.Process == rule.Pattern || strings.Contains(strings.ToLower(ctx.Process), strings.ToLower(rule.Pattern))) {
 				return rule.Action, rule.Target

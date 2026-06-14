@@ -236,6 +236,50 @@ func (a *App) RunWrapper(args []string) {
 		}
 	}
 
+	// Check early if a background daemon is running (pidFile exists).
+	// Use a fixed path so it matches regardless of whether the daemon was
+	// started with sudo.
+	pidFile := GetPIDFilePath()
+	skipPrivileged := false
+	if _, err := os.Stat(pidFile); err == nil {
+		skipPrivileged = true
+		Debugf("Background vproxy detected (PID file: %s)", pidFile)
+	}
+
+	// Fast-path: when the background daemon is already running AND this tool is
+	// proxy-aware (uses HTTP_PROXY env vars), skip all service setup and use the
+	// daemon's existing local HTTP port directly. This avoids both the synchronous
+	// upstream probe (~5s) and bridge startup conflicts with the daemon's bindings.
+	if skipPrivileged && !needsEbpf && needsBridges && !isTUN {
+		directHTTPProxy := fmt.Sprintf("http://127.0.0.1:%d", a.LocalHTTP)
+		Debugf("Fast-path: background daemon detected, using existing HTTP bridge at %s", directHTTPProxy)
+		env := os.Environ()
+		env = append(env, fmt.Sprintf("http_proxy=%s", directHTTPProxy))
+		env = append(env, fmt.Sprintf("https_proxy=%s", directHTTPProxy))
+		env = append(env, fmt.Sprintf("HTTP_PROXY=%s", directHTTPProxy))
+		env = append(env, fmt.Sprintf("HTTPS_PROXY=%s", directHTTPProxy))
+		env = a.appendNoProxyEnv(env)
+		cmd := exec.Command(cmdName, cmdArgs...)
+		cmd.Env = env
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin
+		if err := cmd.Start(); err != nil {
+			Fatalf("Command execution failed: %v", err)
+		}
+		
+		// Dynamic PID rule injection for surgical proxying
+		Debugf("Dynamic PID rule injected for %d (PROXY)", cmd.Process.Pid)
+		
+		if err := cmd.Wait(); err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				os.Exit(exitErr.ExitCode())
+			}
+			Fatalf("Command execution failed: %v", err)
+		}
+		return
+	}
+
 	sm, ph := a.setupServices()
 	sm.Start()
 
@@ -280,10 +324,10 @@ func (a *App) RunWrapper(args []string) {
 	defer cleanup()
 
 	// 1. Setup Transparent Proxying Components
-	skipPrivileged := false
-	pidFile := filepath.Join(os.TempDir(), "vproxy.pid")
+	// (skipPrivileged and pidFile already computed above for the fast-path check)
 	Debugf("Checking for background daemon at %s", pidFile)
 	if _, err := os.Stat(pidFile); err == nil {
+		// Re-confirm skipPrivileged for the transparent-proxy path below.
 		skipPrivileged = true
 		Debugf("Background vproxy detected, skipping privileged server setup")
 	}
@@ -505,6 +549,8 @@ func (a *App) RunWrapper(args []string) {
 		newArgs = append([]string{fmt.Sprintf("--proxy-server=%s", finalHTTPProxy)}, cmdArgs...)
 	case "git", "gemini":
 		// 'agy' uses transparent proxy, so it doesn't need HTTP_PROXY env vars.
+		env = append(env, fmt.Sprintf("http_proxy=%s", finalHTTPProxy))
+		env = append(env, fmt.Sprintf("https_proxy=%s", finalHTTPProxy))
 		env = append(env, fmt.Sprintf("HTTP_PROXY=%s", finalHTTPProxy))
 		env = append(env, fmt.Sprintf("HTTPS_PROXY=%s", finalHTTPProxy))
 		env = a.appendNoProxyEnv(env)
@@ -580,7 +626,7 @@ func (a *App) setupServices() (*ServerManager, *ProxyHandler) {
 	if a.Config.DirectDNS != nil {
 		rm.SetDirectDNS(*a.Config.DirectDNS)
 	}
-	ph := NewProxyHandler(sm, rm, a.LocalSocks, a.LocalHTTP, a.LocalTrans)
+	ph := NewProxyHandler(sm, rm, a.LocalSocks, a.LocalHTTP, a.LocalTrans, a.Config.WebPort)
 	if a.Config.DialTimeoutMs != nil {
 		ph.DialTimeout = time.Duration(*a.Config.DialTimeoutMs) * time.Millisecond
 	}
@@ -597,7 +643,7 @@ func (a *App) watchConfig(path string, ph *ProxyHandler) {
 	}
 	lastMod := stat.ModTime()
 	for {
-		time.Sleep(5 * time.Second)
+		time.Sleep(1 * time.Second)
 		stat, err := os.Stat(path)
 		if err != nil {
 			continue

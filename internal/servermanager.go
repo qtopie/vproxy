@@ -35,12 +35,40 @@ func NewServerManager(servers []string, testInterval, testTimeout time.Duration)
 }
 
 // Start begins the periodic testing of servers in a background goroutine.
+// It performs an initial synchronous probe before returning, which ensures
+// GetBestServer() is ready immediately. Use StartAsync for latency-sensitive
+// callers that can tolerate falling back to the first configured server.
 func (sm *ServerManager) Start() {
 	log.Println("ServerManager: Starting...")
 	// Perform an initial test synchronously.
 	sm.testServers()
 
 	go func() {
+		ticker := time.NewTicker(sm.testInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				sm.testServers()
+			case <-sm.stopChan:
+				log.Println("ServerManager: Stopped.")
+				return
+			}
+		}
+	}()
+}
+
+// StartAsync is like Start but performs the initial server probe in the
+// background, returning immediately. This avoids blocking the caller for
+// testTimeout * numServers when the upstream is slow or unreachable.
+// GetBestServer() may return "" until the first probe completes; callers
+// should fall back to the first configured server in that case.
+func (sm *ServerManager) StartAsync() {
+	log.Println("ServerManager: Starting (async)...")
+	go func() {
+		sm.testServers()
+
 		ticker := time.NewTicker(sm.testInterval)
 		defer ticker.Stop()
 

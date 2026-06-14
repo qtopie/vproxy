@@ -48,6 +48,7 @@ type pfiocNatlook struct {
 	Proto     uint8
 	ProtoVar  uint8
 	Direction uint8
+	_         [4]byte // Padding to match struct size 84 (observed via C)
 }
 
 func GetOriginalDst(conn net.Conn) (string, error) {
@@ -59,7 +60,7 @@ func GetOriginalDst(conn net.Conn) (string, error) {
 	clientAddr := tc.RemoteAddr().(*net.TCPAddr)
 	proxyAddr := tc.LocalAddr().(*net.TCPAddr)
 
-	fd, err := os.OpenFile("/dev/pf", os.O_RDWR, 0666)
+	fd, err := os.OpenFile("/dev/pf", os.O_RDWR, 0)
 	if err != nil {
 		return "", fmt.Errorf("failed to open /dev/pf: %v", err)
 	}
@@ -80,15 +81,17 @@ func GetOriginalDst(conn net.Conn) (string, error) {
 		copy(nl.Daddr[:], proxyAddr.IP.To4())
 	}
 
+	// Ports must be in network byte order (big endian)
 	binary.BigEndian.PutUint16(nl.Sxport[:2], uint16(clientAddr.Port))
 	binary.BigEndian.PutUint16(nl.Dxport[:2], uint16(proxyAddr.Port))
 
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd.Fd(), DIOCNATLOOK, uintptr(unsafe.Pointer(&nl)))
 	if errno != 0 {
+		// Try other direction
 		nl.Direction = PF_IN
 		_, _, errno = syscall.Syscall(syscall.SYS_IOCTL, fd.Fd(), DIOCNATLOOK, uintptr(unsafe.Pointer(&nl)))
 		if errno != 0 {
-			return "", fmt.Errorf("DIOCNATLOOK failed: %v", errno)
+			return "", fmt.Errorf("DIOCNATLOOK failed (errno %d) for %s:%d -> %s:%d", errno, clientAddr.IP, clientAddr.Port, proxyAddr.IP, proxyAddr.Port)
 		}
 	}
 
@@ -136,7 +139,7 @@ func ReadFromUDPWithOrigDst(conn *net.UDPConn, b []byte, oob []byte) (n int, src
 	return 0, nil, nil, fmt.Errorf("not implemented on macOS")
 }
 
-func StartDarwinTransparent(ctx context.Context, tcpHandler func(net.Conn), udpHandler func(context.Context, net.Conn, string)) error {
+func StartDarwinTransparent(ctx context.Context, httpPort, socksPort, webPort int, tcpHandler func(net.Conn), udpHandler func(context.Context, net.Conn, string)) error {
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -186,10 +189,14 @@ func StartDarwinTransparent(ctx context.Context, tcpHandler func(net.Conn), udpH
 		for {
 			n, remoteAddr, err := udpConn.ReadFrom(buf)
 			if err != nil {
+				log.Printf("[PF] DNS Listener error: %v", err)
 				return
 			}
+			log.Printf("[PF] Received DNS query from %v (%d bytes)", remoteAddr, n)
 			resp, domain, err := dns.HandleDNSQuery(buf[:n])
 			if err != nil {
+				log.Printf("[PF] DNS Handle error for %s: %v", domain, err)
+				// Forward to real DNS? For now just skip
 				continue
 			}
 			log.Printf("[PF] DNS Hijacked: %s -> Fake-IP", domain)
@@ -198,7 +205,7 @@ func StartDarwinTransparent(ctx context.Context, tcpHandler func(net.Conn), udpH
 	}()
 
 	// 4. Setup PF Rules
-	err = setupPF(tcpPort, dnsPort)
+	err = setupPF(tcpPort, dnsPort, httpPort, socksPort, webPort)
 	if err != nil {
 		return fmt.Errorf("failed to setup PF rules: %v", err)
 	}
@@ -206,63 +213,74 @@ func StartDarwinTransparent(ctx context.Context, tcpHandler func(net.Conn), udpH
 	return nil
 }
 
-func setupPF(tcpPort, dnsPort int) error {
-	// The proxy daemon itself runs as root (due to sudo bin/vproxy init)
-	// We want to intercept all traffic EXCEPT the proxy's own traffic.
-	// So we exempt "root".
+func setupPF(tcpPort, dnsPort, httpPort, socksPort, webPort int) error {
 	vproxyUser := "root"
-
 	confPath := "/tmp/vproxy_pf.conf"
 	
-	// PF rules to redirect traffic but skip vproxy's own traffic
-	rules := fmt.Sprintf(`
+	excludePorts := []string{
+		fmt.Sprintf("%d", tcpPort),
+		fmt.Sprintf("%d", httpPort),
+		fmt.Sprintf("%d", socksPort),
+		fmt.Sprintf("%d", webPort),
+	}
+	portList := strings.Join(excludePorts, ", ")
+
+	// 1. Generate the isolated ruleset for the vproxy anchor
+	anchorRules := fmt.Sprintf(`
 vproxy_user = "%s"
-ext_if = "%s"
+proxy_ports = "{ %s }"
+lan_nets = "{ 127.0.0.0/8, 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 169.254.0.0/16, 224.0.0.0/4, fe80::/10, fd00::/8, ff00::/8 }"
 
-# NORMALIZATION RULES
-scrub-anchor "com.apple/*" all fragment reassemble
+# --- BYPASS RULES (Highest Priority) ---
+# Allow all loopback and LAN traffic without any redirection
+pass in quick on lo0 all
+pass out quick on lo0 all
+pass out quick proto icmp all keep state
+pass out quick proto icmp6 all keep state
+pass out quick to $lan_nets keep state
+pass in quick from $lan_nets to any keep state
 
-# TRANSLATION RULES
-nat-anchor "com.apple/*" all
-rdr-anchor "com.apple/*" all
+# Prevent loops for vproxy itself (root)
+pass out quick user $vproxy_user keep state
 
-# Redirect DNS (53) to vproxy
+# Bypass for explicit proxy ports
+pass out quick inet proto tcp from any to any port $proxy_ports keep state
+
+# --- REDIRECTION (RDR) ---
+# Redirect intercepted traffic arriving at lo0 (from route-to below)
 rdr pass on lo0 inet proto udp from any to any port 53 -> 127.0.0.1 port %d
-rdr pass on $ext_if inet proto udp from any to any port 53 -> 127.0.0.1 port %d
-
-# Redirect TCP traffic to vproxy
 rdr pass on lo0 inet proto tcp from any to any -> 127.0.0.1 port %d
-rdr pass on $ext_if inet proto tcp from any to any -> 127.0.0.1 port %d
 
-# FILTER RULES
-anchor "com.apple/*" all
+# --- INTERCEPTION (Steering) ---
+# Steering non-local TCP/DNS traffic to lo0
+# Note: we only route-to lo0 if the destination is NOT a LAN address
+pass out on %s route-to lo0 inet proto tcp from any to ! $lan_nets user != $vproxy_user keep state
+pass out on %s route-to lo0 inet proto udp from any to ! $lan_nets port 53 user != $vproxy_user keep state
+`, vproxyUser, portList, dnsPort, tcpPort, physIface, physIface)
 
-# Explicitly pass vproxy's own traffic and keep state so return packets aren't hijacked
-pass out inet proto tcp all user $vproxy_user flags S/SA keep state
-pass out inet proto udp all user $vproxy_user keep state
-
-# Route-to passes the local traffic to loopback for redirection, if it doesn't match the user
-pass out route-to lo0 inet proto tcp all user != $vproxy_user flags S/SA keep state
-pass out route-to lo0 inet proto udp from any to any port 53 user != $vproxy_user keep state
-`, vproxyUser, physIface, dnsPort, dnsPort, tcpPort, tcpPort)
-
-
-	if err := os.WriteFile(confPath, []byte(rules), 0644); err != nil {
+	if err := os.WriteFile(confPath, []byte(anchorRules), 0644); err != nil {
 		return fmt.Errorf("failed to write pf conf: %v", err)
 	}
 
-	// Enable PF if not already enabled
+	// 2. Enable PF
 	exec.Command("pfctl", "-e").Run()
 	
-	// Load rules
-	cmd := exec.Command("pfctl", "-f", confPath)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("pfctl -f failed: %v, output: %s", err, out)
+	// 3. Load rules into the anchor
+	cmd := exec.Command("pfctl", "-a", "vproxy", "-f", confPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to load pf anchor: %v, output: %s", err, out)
 	}
+
+	// 4. Inject the anchor references into the main ruleset without flushing it
+	// We use a temporary file to hold the main rule pointers
+	mainConf := "rdr-anchor \"vproxy\"\nanchor \"vproxy\"\n"
+	mainConfPath := "/tmp/vproxy_main.conf"
+	os.WriteFile(mainConfPath, []byte(mainConf), 0644)
+	
+	exec.Command("pfctl", "-g", "-f", mainConfPath).Run()
 	
 	pfEnabled = true
-	log.Printf("[PF] Rules loaded successfully via %s", confPath)
+	log.Printf("[PF] Anchor 'vproxy' loaded successfully")
 	return nil
 }
 
@@ -280,10 +298,12 @@ func Cleanup() {
 	}
 
 	if pfEnabled {
-		// Restore default rules
-		exec.Command("pfctl", "-F", "all", "-f", "/etc/pf.conf").Run()
+		// Flush only our anchor and its references
+		exec.Command("pfctl", "-a", "vproxy", "-F", "all").Run()
+		// Try to restore system rules if possible, but at least clear our anchor
+		exec.Command("pfctl", "-f", "/etc/pf.conf").Run()
 		pfEnabled = false
-		log.Printf("[PF] Rules cleared and restored to system defaults")
+		log.Printf("[PF] vproxy anchor cleared")
 	}
 }
 

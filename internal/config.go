@@ -93,3 +93,22 @@ func LoadConfig(path string) (*Config, string, error) {
 
 	return &cfg, finalPath, nil
 }
+
+// GetPIDFilePath returns the platform-specific path for the PID file.
+// It uses a shared location so that both privileged and unprivileged users
+// can check the daemon's status.
+func GetPIDFilePath() string {
+	if runtime.GOOS == "windows" {
+		// On Windows, use a subfolder in ProgramData for shared access.
+		// Fallback to os.TempDir() if ProgramData is not accessible.
+		programData := os.Getenv("ProgramData")
+		if programData != "" {
+			path := filepath.Join(programData, "vproxy")
+			_ = os.MkdirAll(path, 0755)
+			return filepath.Join(path, "vproxy.pid")
+		}
+		return filepath.Join(os.TempDir(), "vproxy.pid")
+	}
+	// Unix systems: use /tmp as it is globally writable and shared.
+	return "/tmp/vproxy.pid"
+}
