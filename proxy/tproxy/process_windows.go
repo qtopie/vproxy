@@ -89,23 +89,27 @@ func getProcessPath(pid int) (string, error) {
 // The path is stored in MatchContext.Process and matched case-insensitively as a
 // substring, so PROCESS rules work with both short names ("Telegram") and full
 // paths ("C:\Program Files\Telegram Desktop").
-func GetProcessNameByPort(port int) (string, error) {
+func GetProcessNameByPort(port int) (string, int, error) {
 	pid, err := getPidByPort(port)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
-	return getProcessPath(pid)
+	path, err := getProcessPath(pid)
+	if err != nil {
+		return "", 0, err
+	}
+	return path, pid, nil
 }
 
 // GetProcessNameByConn returns the full executable path of the process that owns
 // the connection's remote address (which is the app's local address in TUN mode).
-func GetProcessNameByConn(conn interface{}) (string, error) {
+func GetProcessNameByConn(conn interface{}) (string, int, error) {
 	type remoteAddrIface interface {
 		RemoteAddr() net.Addr
 	}
 	c, ok := conn.(remoteAddrIface)
 	if !ok {
-		return "", fmt.Errorf("could not determine source port from connection")
+		return "", 0, fmt.Errorf("could not determine source port from connection")
 	}
 	switch addr := c.RemoteAddr().(type) {
 	case *net.TCPAddr:
@@ -113,5 +117,5 @@ func GetProcessNameByConn(conn interface{}) (string, error) {
 	case *net.UDPAddr:
 		return GetProcessNameByPort(addr.Port)
 	}
-	return "", fmt.Errorf("unsupported address type")
+	return "", 0, fmt.Errorf("unsupported address type")
 }

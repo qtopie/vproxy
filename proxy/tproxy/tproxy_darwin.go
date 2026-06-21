@@ -20,10 +20,10 @@ import (
 )
 
 var (
-	physIface  string // Cached physical interface name (e.g., en0)
-	physIP     net.IP // Cached physical interface IPv4 address
-	mu         sync.Mutex
-	pfEnabled  bool
+	physIface    string // Cached physical interface name (e.g., en0)
+	physIP       net.IP // Cached physical interface IPv4 address
+	mu           sync.Mutex
+	pfEnabled    bool
 	localTransLn net.Listener
 	localDNSLn   *net.UDPConn
 )
@@ -216,7 +216,7 @@ func StartDarwinTransparent(ctx context.Context, httpPort, socksPort, webPort in
 func setupPF(tcpPort, dnsPort, httpPort, socksPort, webPort int) error {
 	vproxyUser := "root"
 	confPath := "/tmp/vproxy_pf.conf"
-	
+
 	excludePorts := []string{
 		fmt.Sprintf("%d", tcpPort),
 		fmt.Sprintf("%d", httpPort),
@@ -224,63 +224,57 @@ func setupPF(tcpPort, dnsPort, httpPort, socksPort, webPort int) error {
 		fmt.Sprintf("%d", webPort),
 	}
 	portList := strings.Join(excludePorts, ", ")
+	routeIface := "! lo0"
 
-	// 1. Generate the isolated ruleset for the vproxy anchor
-	anchorRules := fmt.Sprintf(`
+	// PF rules to redirect traffic while preserving local/LAN access and avoiding self-loops.
+	rules := fmt.Sprintf(`
 vproxy_user = "%s"
 proxy_ports = "{ %s }"
-lan_nets = "{ 127.0.0.0/8, 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 169.254.0.0/16, 224.0.0.0/4, fe80::/10, fd00::/8, ff00::/8 }"
+table <private_ips> const { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4, 240.0.0.0/4 }
+
+# --- REDIRECTION (RDR) ---
+rdr pass on lo0 inet proto udp from any to any port 53 -> 127.0.0.1 port %d
+rdr pass on ! lo0 inet proto udp from any to any port 53 -> 127.0.0.1 port %d
+rdr pass on lo0 inet proto tcp from any to ! <private_ips> -> 127.0.0.1 port %d
 
 # --- BYPASS RULES (Highest Priority) ---
-# Allow all loopback and LAN traffic without any redirection
 pass in quick on lo0 all
 pass out quick on lo0 all
 pass out quick proto icmp all keep state
 pass out quick proto icmp6 all keep state
-pass out quick to $lan_nets keep state
-pass in quick from $lan_nets to any keep state
-
-# Prevent loops for vproxy itself (root)
+pass out quick to <private_ips> keep state
+pass in quick from <private_ips> to any keep state
 pass out quick user $vproxy_user keep state
-
-# Bypass for explicit proxy ports
 pass out quick inet proto tcp from any to any port $proxy_ports keep state
 
-# --- REDIRECTION (RDR) ---
-# Redirect intercepted traffic arriving at lo0 (from route-to below)
-rdr pass on lo0 inet proto udp from any to any port 53 -> 127.0.0.1 port %d
-rdr pass on lo0 inet proto tcp from any to any -> 127.0.0.1 port %d
-
 # --- INTERCEPTION (Steering) ---
-# Steering non-local TCP/DNS traffic to lo0
-# Note: we only route-to lo0 if the destination is NOT a LAN address
-pass out on %s route-to lo0 inet proto tcp from any to ! $lan_nets user != $vproxy_user keep state
-pass out on %s route-to lo0 inet proto udp from any to ! $lan_nets port 53 user != $vproxy_user keep state
-`, vproxyUser, portList, dnsPort, tcpPort, physIface, physIface)
+pass out on %s route-to lo0 inet proto tcp from any to ! <private_ips> user != $vproxy_user flags S/SA keep state
+pass out on %s route-to lo0 inet proto udp from any to any port 53 user != $vproxy_user keep state
+ `, vproxyUser, portList, dnsPort, dnsPort, tcpPort, routeIface, routeIface)
 
-	if err := os.WriteFile(confPath, []byte(anchorRules), 0644); err != nil {
+	if err := os.WriteFile(confPath, []byte(rules), 0644); err != nil {
 		return fmt.Errorf("failed to write pf conf: %v", err)
 	}
 
 	// 2. Enable PF
 	exec.Command("pfctl", "-e").Run()
-	
-	// 3. Load rules into the anchor
-	cmd := exec.Command("pfctl", "-a", "vproxy", "-f", confPath)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to load pf anchor: %v, output: %s", err, out)
+
+	// Load rules into com.apple/vproxy anchor so we don't destroy system/third-party PF rules
+	cmd := exec.Command("pfctl", "-a", "com.apple/vproxy", "-f", confPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("pfctl loading anchor failed: %v, output: %s", err, out)
 	}
 
-	// 4. Inject the anchor references into the main ruleset without flushing it
-	// We use a temporary file to hold the main rule pointers
-	mainConf := "rdr-anchor \"vproxy\"\nanchor \"vproxy\"\n"
+	// 4. Inject the anchor references into the main ruleset without flushing it.
+	mainConf := "rdr-anchor \"com.apple/vproxy\"\nanchor \"com.apple/vproxy\"\n"
 	mainConfPath := "/tmp/vproxy_main.conf"
 	os.WriteFile(mainConfPath, []byte(mainConf), 0644)
-	
+
 	exec.Command("pfctl", "-g", "-f", mainConfPath).Run()
-	
+
 	pfEnabled = true
-	log.Printf("[PF] Anchor 'vproxy' loaded successfully")
+	log.Printf("[PF] Rules loaded successfully into com.apple/vproxy anchor via %s", confPath)
 	return nil
 }
 
@@ -298,12 +292,10 @@ func Cleanup() {
 	}
 
 	if pfEnabled {
-		// Flush only our anchor and its references
-		exec.Command("pfctl", "-a", "vproxy", "-F", "all").Run()
-		// Try to restore system rules if possible, but at least clear our anchor
-		exec.Command("pfctl", "-f", "/etc/pf.conf").Run()
+		// Clean up only our anchor com.apple/vproxy without touching system default rules
+		exec.Command("pfctl", "-a", "com.apple/vproxy", "-F", "all").Run()
 		pfEnabled = false
-		log.Printf("[PF] vproxy anchor cleared")
+		log.Printf("[PF] Rules cleared from anchor com.apple/vproxy")
 	}
 }
 

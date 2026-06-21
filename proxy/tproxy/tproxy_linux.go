@@ -277,7 +277,7 @@ func setupRoutingLinux(tunName string) error {
 		return fmt.Errorf("failed to assign IPv4 to %s: %w", tunName, err)
 	}
 	exec.Command("ip", "-6", "addr", "add", "fc00:198:18::1/64", "dev", tunName).Run()
-	
+
 	if err := exec.Command("ip", "link", "set", "dev", tunName, "up").Run(); err != nil {
 		return fmt.Errorf("failed to set %s link up: %w", tunName, err)
 	}
@@ -352,18 +352,18 @@ func GetDialerControl() func(network, address string, c syscall.RawConn) error {
 }
 
 // StartDarwinTransparent is not supported on Linux.
-func StartDarwinTransparent(_ context.Context, _ func(net.Conn), _ func(context.Context, net.Conn, string)) error {
+func StartDarwinTransparent(_ context.Context, _, _, _ int, _ func(net.Conn), _ func(context.Context, net.Conn, string)) error {
 	return fmt.Errorf("StartDarwinTransparent not supported on Linux")
 }
 
 // GetProcessNameByPort is not implemented on Linux.
-func GetProcessNameByPort(_ int) (string, error) {
-	return "", fmt.Errorf("GetProcessNameByPort not implemented on Linux")
+func GetProcessNameByPort(_ int) (string, int, error) {
+	return "", 0, fmt.Errorf("GetProcessNameByPort not implemented on Linux")
 }
 
 // GetProcessNameByConn is not implemented on Linux.
-func GetProcessNameByConn(_ interface{}) (string, error) {
-	return "", fmt.Errorf("GetProcessNameByConn not implemented on Linux")
+func GetProcessNameByConn(_ interface{}) (string, int, error) {
+	return "", 0, fmt.Errorf("GetProcessNameByConn not implemented on Linux")
 }
 
 type icmpInterceptor struct {

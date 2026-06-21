@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime"
 	"time"
 
 	"github.com/qtopie/vproxy/proxy/tproxy"
@@ -12,7 +13,16 @@ import (
 
 func main() {
 	fmt.Println("=== Test 5: SO_ORIGINAL_DST Extraction ===")
-	
+
+	if runtime.GOOS != "linux" {
+		fmt.Printf("ℹ️ Skipping SO_ORIGINAL_DST test on %s: iptables REDIRECT validation is Linux-only.\n", runtime.GOOS)
+		return
+	}
+	if _, err := exec.LookPath("iptables"); err != nil {
+		fmt.Println("ℹ️ Skipping SO_ORIGINAL_DST test: iptables is not available.")
+		return
+	}
+
 	ln, err := net.Listen("tcp", "127.0.0.1:12345")
 	if err != nil {
 		fmt.Printf("❌ Failed to bind listener: %v\n", err)
@@ -45,7 +55,7 @@ func main() {
 	if err == nil {
 		conn.Close()
 	}
-	
+
 	time.Sleep(500 * time.Millisecond)
 	fmt.Println("Test finished.")
 }

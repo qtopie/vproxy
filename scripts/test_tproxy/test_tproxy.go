@@ -15,8 +15,9 @@ import (
 	"github.com/qtopie/vproxy/proxy/tproxy"
 	"github.com/qtopie/vproxy/socks"
 )
+
 func main() {
-	upstream := "192.168.50.31:1080"
+	upstream := "127.0.0.1:1080"
 	tproxyPort := 10080
 
 	// Phase 2: Check for CAP_NET_ADMIN and enable marking

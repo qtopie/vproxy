@@ -181,6 +181,19 @@ func (rm *RuleManager) SetDirectDNS(direct bool) {
 	rm.directDNS = direct
 }
 
+// HasProcessMetadataRules returns true if there is at least one PROCESS or PID rule configured.
+func (rm *RuleManager) HasProcessMetadataRules() bool {
+	if rm == nil {
+		return false
+	}
+	for _, rule := range rm.rules {
+		if rule.Type == RuleTypeProcess || rule.Type == RuleTypePID {
+			return true
+		}
+	}
+	return false
+}
+
 // Match matches a host against the configured rules.
 func (rm *RuleManager) Match(host string) (RuleAction, string) {
 	return rm.MatchContext(MatchContext{Host: host})

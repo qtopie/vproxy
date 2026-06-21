@@ -79,6 +79,10 @@ func (ph *ProxyHandler) UpdateRules(rules []string, directDNS bool) {
 	ph.rm.SetDirectDNS(directDNS)
 }
 
+func (ph *ProxyHandler) needsProcessMetadata() bool {
+	return ph.rm != nil && ph.rm.HasProcessMetadataRules()
+}
+
 func (ph *ProxyHandler) StartSocks() error {
 	if ph.socksLn != nil {
 		return nil
@@ -218,7 +222,7 @@ func (ph *ProxyHandler) handleUDP(ctx context.Context, local net.Conn, target st
 	defer local.Close()
 	process := ""
 	pid := 0
-	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+	if (runtime.GOOS == "darwin" || runtime.GOOS == "windows") && ph.needsProcessMetadata() {
 		process, pid, _ = tproxy.GetProcessNameByConn(local)
 	}
 	upstream, err := ph.dialTargetUDP(target, process, pid)
@@ -236,7 +240,6 @@ func (ph *ProxyHandler) handleUDP(ctx context.Context, local net.Conn, target st
 	io.Copy(local, upstream)
 	<-done
 }
-
 
 func (ph *ProxyHandler) Stop() {
 	if ph.socksLn != nil {
@@ -357,7 +360,7 @@ func (ph *ProxyHandler) serveTransparentUDP() {
 		if !loaded {
 			process := ""
 			pid := 0
-			if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+			if (runtime.GOOS == "darwin" || runtime.GOOS == "windows") && ph.needsProcessMetadata() {
 				process, pid, _ = tproxy.GetProcessNameByPort(src.Port)
 			}
 			Infof("[UDP] Intercepted new UDP session from %s (Process: %s, PID: %d) targeting %s", src.String(), process, pid, dst.String())
@@ -438,7 +441,7 @@ func (ph *ProxyHandler) serveHTTP() {
 
 			process := ""
 			pid := 0
-			if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+			if (runtime.GOOS == "darwin" || runtime.GOOS == "windows") && ph.needsProcessMetadata() {
 				process, pid, _ = tproxy.GetProcessNameByConn(conn)
 			}
 
@@ -828,7 +831,7 @@ func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 
 	process := ""
 	pid := 0
-	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+	if (runtime.GOOS == "darwin" || runtime.GOOS == "windows") && ph.needsProcessMetadata() {
 		process, pid, _ = tproxy.GetProcessNameByConn(conn)
 	}
 
@@ -875,10 +878,10 @@ func dialHTTPWithTimeout(proxyAddr, target string, timeout time.Duration) (net.C
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Set read/write deadline for HTTP CONNECT handshake
 	conn.SetDeadline(time.Now().Add(timeout))
-	
+
 	// Create a buffered reader to read the response headers
 	br := bufio.NewReader(conn)
 	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target)
@@ -891,10 +894,10 @@ func dialHTTPWithTimeout(proxyAddr, target string, timeout time.Duration) (net.C
 		conn.Close()
 		return nil, fmt.Errorf("HTTP proxy error: %s", resp.Status)
 	}
-	
+
 	// Reset the deadline so normal connection operations are not timed out!
 	conn.SetDeadline(time.Time{})
-	
+
 	// Return a wrapped connection that includes any data already read into the buffer
 	Debugf("[Dial] Established HTTP CONNECT tunnel to %s via %s (buffered: %d bytes)", target, proxyAddr, br.Buffered())
 	return &peekedConn{Reader: br, Conn: conn}, nil

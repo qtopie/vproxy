@@ -366,6 +366,6 @@ func GetDialerControl() func(network, address string, c syscall.RawConn) error {
 }
 
 // StartDarwinTransparent is not supported on Windows.
-func StartDarwinTransparent(_ context.Context, _ func(net.Conn), _ func(context.Context, net.Conn, string)) error {
+func StartDarwinTransparent(_ context.Context, _, _, _ int, _ func(net.Conn), _ func(context.Context, net.Conn, string)) error {
 	return fmt.Errorf("StartDarwinTransparent not supported on Windows")
 }

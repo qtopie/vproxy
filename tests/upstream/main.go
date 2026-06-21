@@ -11,7 +11,7 @@ import (
 
 func main() {
 	fmt.Println("=== Test 2: Upstream Proxy Connectivity ===")
-	proxyStr := "socks5://192.168.50.31:1080"
+	proxyStr := "socks5://127.0.0.1:1080"
 	if len(os.Args) > 1 {
 		proxyStr = os.Args[1]
 	}

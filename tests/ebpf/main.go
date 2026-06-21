@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/qtopie/vproxy/proxy/cgroup"
@@ -12,7 +13,12 @@ import (
 
 func main() {
 	fmt.Println("=== Test 4: eBPF Interception ===")
-	
+
+	if runtime.GOOS != "linux" {
+		fmt.Printf("ℹ️ Skipping eBPF interception test on %s: eBPF interception is Linux-only.\n", runtime.GOOS)
+		return
+	}
+
 	// 1. Setup Cgroup
 	if err := cgroup.EnsureVProxyCgroup(); err != nil {
 		fmt.Printf("❌ Failed to ensure cgroup: %v\n", err)
@@ -62,7 +68,7 @@ func main() {
 		fmt.Printf("✅ Dial succeeded to: %s\n", conn.RemoteAddr())
 		conn.Close()
 	}
-	
+
 	time.Sleep(1 * time.Second)
 	fmt.Println("Test finished.")
 }
