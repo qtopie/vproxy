@@ -215,7 +215,7 @@ func (ph *ProxyHandler) handleUDP(ctx context.Context, local net.Conn, target st
 
 	defer local.Close()
 	process := ""
-	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+	if (runtime.GOOS == "darwin" || runtime.GOOS == "windows") && ph.rm != nil && ph.rm.HasProcessRules() {
 		process, _ = tproxy.GetProcessNameByConn(local)
 	}
 	upstream, err := ph.dialTargetUDP(target, process)
@@ -353,7 +353,7 @@ func (ph *ProxyHandler) serveTransparentUDP() {
 		var upstream net.Conn
 		if !loaded {
 			process := ""
-			if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+			if (runtime.GOOS == "darwin" || runtime.GOOS == "windows") && ph.rm != nil && ph.rm.HasProcessRules() {
 				process, _ = tproxy.GetProcessNameByPort(src.Port)
 			}
 			Infof("[UDP] Intercepted new UDP session from %s (Process: %s) targeting %s", src.String(), process, dst.String())
@@ -433,7 +433,7 @@ func (ph *ProxyHandler) serveHTTP() {
 			}
 
 			process := ""
-			if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+			if (runtime.GOOS == "darwin" || runtime.GOOS == "windows") && ph.rm != nil && ph.rm.HasProcessRules() {
 				process, _ = tproxy.GetProcessNameByConn(conn)
 			}
 
@@ -822,7 +822,7 @@ func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 	}
 
 	process := ""
-	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+	if (runtime.GOOS == "darwin" || runtime.GOOS == "windows") && ph.rm != nil && ph.rm.HasProcessRules() {
 		process, _ = tproxy.GetProcessNameByConn(conn)
 	}
 

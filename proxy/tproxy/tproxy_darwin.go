@@ -214,37 +214,30 @@ func setupPF(tcpPort, dnsPort int) error {
 
 	confPath := "/tmp/vproxy_pf.conf"
 	
-	// PF rules to redirect traffic but skip vproxy's own traffic
+	// PF rules to redirect traffic but skip vproxy's own traffic.
+	// Excludes private IP ranges (LAN) and local loopback from being proxied.
 	rules := fmt.Sprintf(`
 vproxy_user = "%s"
-ext_if = "%s"
 
-# NORMALIZATION RULES
-scrub-anchor "com.apple/*" all fragment reassemble
-
-# TRANSLATION RULES
-nat-anchor "com.apple/*" all
-rdr-anchor "com.apple/*" all
+# LAN / Private IP ranges to exclude from proxying
+table <private_ips> const { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4, 240.0.0.0/4 }
 
 # Redirect DNS (53) to vproxy
-rdr pass on lo0 inet proto udp from any to any port 53 -> 127.0.0.1 port %d
-rdr pass on $ext_if inet proto udp from any to any port 53 -> 127.0.0.1 port %d
+rdr pass on lo0 inet proto udp from any to ! 127.0.0.0/8 port 53 -> 127.0.0.1 port %d
+rdr pass on ! lo0 inet proto udp from any to any port 53 -> 127.0.0.1 port %d
 
-# Redirect TCP traffic to vproxy
-rdr pass on lo0 inet proto tcp from any to any -> 127.0.0.1 port %d
-rdr pass on $ext_if inet proto tcp from any to any -> 127.0.0.1 port %d
-
-# FILTER RULES
-anchor "com.apple/*" all
+# Redirect TCP traffic to vproxy (only if not destined to local/LAN addresses)
+rdr pass on lo0 inet proto tcp from any to ! <private_ips> -> 127.0.0.1 port %d
 
 # Explicitly pass vproxy's own traffic and keep state so return packets aren't hijacked
 pass out inet proto tcp all user $vproxy_user flags S/SA keep state
 pass out inet proto udp all user $vproxy_user keep state
 
-# Route-to passes the local traffic to loopback for redirection, if it doesn't match the user
-pass out route-to lo0 inet proto tcp all user != $vproxy_user flags S/SA keep state
-pass out route-to lo0 inet proto udp from any to any port 53 user != $vproxy_user keep state
-`, vproxyUser, physIface, dnsPort, dnsPort, tcpPort, tcpPort)
+# Route-to passes the traffic to loopback for redirection, if it doesn't match the user,
+# is on a physical interface (not lo0), and is NOT destined to private/LAN IPs.
+pass out on ! lo0 route-to lo0 inet proto tcp from any to ! <private_ips> user != $vproxy_user flags S/SA keep state
+pass out on ! lo0 route-to lo0 inet proto udp from any to any port 53 user != $vproxy_user keep state
+`, vproxyUser, dnsPort, dnsPort, tcpPort)
 
 
 	if err := os.WriteFile(confPath, []byte(rules), 0644); err != nil {
@@ -254,15 +247,15 @@ pass out route-to lo0 inet proto udp from any to any port 53 user != $vproxy_use
 	// Enable PF if not already enabled
 	exec.Command("pfctl", "-e").Run()
 	
-	// Load rules
-	cmd := exec.Command("pfctl", "-f", confPath)
+	// Load rules into com.apple/vproxy anchor so we don't destroy system/third-party PF rules
+	cmd := exec.Command("pfctl", "-a", "com.apple/vproxy", "-f", confPath)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("pfctl -f failed: %v, output: %s", err, out)
+		return fmt.Errorf("pfctl loading anchor failed: %v, output: %s", err, out)
 	}
 	
 	pfEnabled = true
-	log.Printf("[PF] Rules loaded successfully via %s", confPath)
+	log.Printf("[PF] Rules loaded successfully into com.apple/vproxy anchor via %s", confPath)
 	return nil
 }
 
@@ -280,10 +273,10 @@ func Cleanup() {
 	}
 
 	if pfEnabled {
-		// Restore default rules
-		exec.Command("pfctl", "-F", "all", "-f", "/etc/pf.conf").Run()
+		// Clean up only our anchor com.apple/vproxy without touching system default rules
+		exec.Command("pfctl", "-a", "com.apple/vproxy", "-F", "all").Run()
 		pfEnabled = false
-		log.Printf("[PF] Rules cleared and restored to system defaults")
+		log.Printf("[PF] Rules cleared from anchor com.apple/vproxy")
 	}
 }
 

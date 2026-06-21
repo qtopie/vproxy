@@ -21,6 +21,40 @@
 sudo vproxy init
 ```
 
+#### systemd 服务配置
+
+为了让 `vproxy` 在系统启动时自动运行，且在退出或崩溃后自动重启，可以配置为 `systemd` 服务。
+
+在 `/etc/systemd/system/vproxy.service` 中写入以下配置（注意将 `SUDO_USER` 修改为你日常使用的普通用户名，以便非 root 进程能正常执行 cgroup 迁移）：
+
+```ini
+[Unit]
+Description=vproxy Transparent Proxy Server
+After=network.target
+
+[Service]
+Type=forking
+PIDFile=/tmp/vproxy.pid
+Environment=SUDO_USER=your_username
+ExecStartPre=/usr/local/bin/vproxy clean
+ExecStart=/usr/local/bin/vproxy -c /etc/vproxy/config.json init
+ExecStop=/usr/local/bin/vproxy clean
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+```
+
+然后，执行以下命令来启用并启动服务：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable vproxy
+sudo systemctl start vproxy
+```
+
 ### 2. 基础用法
 
 #### 场景 A：透明代理整个终端会话

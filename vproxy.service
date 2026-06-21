@@ -1,0 +1,17 @@
+[Unit]
+Description=vproxy Transparent Proxy Server
+After=network.target
+
+[Service]
+Type=forking
+PIDFile=/tmp/vproxy.pid
+Environment=SUDO_USER={USER}
+ExecStartPre=/usr/local/bin/vproxy clean
+ExecStart=/usr/local/bin/vproxy -c /etc/vproxy/config.json init
+ExecStop=/usr/local/bin/vproxy clean
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

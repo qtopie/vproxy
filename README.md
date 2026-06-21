@@ -136,6 +136,40 @@ Starts the transparent proxy routing engine globally.
 sudo vproxy init
 ```
 
+#### Systemd Service configuration (Linux)
+
+To run `vproxy` as a system background service that starts on boot and restarts automatically if it crashes or exits, you can register it as a systemd service.
+
+Create `/etc/systemd/system/vproxy.service` with the following configuration (replace `SUDO_USER` with your normal daily username, which allows non-root commands to perform cgroup migration successfully):
+
+```ini
+[Unit]
+Description=vproxy Transparent Proxy Server
+After=network.target
+
+[Service]
+Type=forking
+PIDFile=/tmp/vproxy.pid
+Environment=SUDO_USER=your_username
+ExecStartPre=/usr/local/bin/vproxy clean
+ExecStart=/usr/local/bin/vproxy -c /etc/vproxy/config.json init
+ExecStop=/usr/local/bin/vproxy clean
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then, reload systemd, enable, and start the service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable vproxy
+sudo systemctl start vproxy
+```
+
 ### 2. Wrap Individual Commands (Cgroups-isolated CLI Wrapping)
 Run a specific application through `vproxy`'s transparent proxy pipeline:
 ```bash

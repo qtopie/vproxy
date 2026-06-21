@@ -120,7 +120,19 @@ func HandleDNSQuery(query []byte) ([]byte, string, error) {
 	qType := binary.BigEndian.Uint16(query[offset : offset+2])
 	// We only care about A records (Type 1)
 	if qType != 1 {
-		return nil, domain, fmt.Errorf("only A records supported")
+		if qType == 28 { // AAAA
+			// Return empty NOERROR response
+			resp := make([]byte, 0, 12+len(query[12:offset+4]))
+			resp = append(resp, id...)
+			resp = append(resp, 0x81, 0x80)            // response, no error
+			resp = append(resp, query[4:6]...)         // QDCOUNT
+			resp = append(resp, 0, 0)                  // ANCOUNT = 0
+			resp = append(resp, 0, 0)                  // NSCOUNT
+			resp = append(resp, 0, 0)                  // ARCOUNT
+			resp = append(resp, query[12:offset+4]...) // Question section
+			return resp, domain, nil
+		}
+		return nil, domain, fmt.Errorf("only A and AAAA records supported")
 	}
 
 	fakeIP := GlobalPool.GetIP(domain)
