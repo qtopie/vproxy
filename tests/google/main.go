@@ -29,10 +29,15 @@ func main() {
 		testMode = "transparent"
 	}
 	testIntercept := strings.ToLower(os.Getenv("TEST_INTERCEPT"))
+	testMethod := strings.ToUpper(os.Getenv("TEST_METHOD"))
+	if testMethod == "" {
+		testMethod = http.MethodGet
+	}
 
 	fmt.Printf("\033[1;33m[*] Configurations Detected:\033[0m\n")
 	fmt.Printf("    - Protocol Flag  (TEST_PROTO):      %s\n", testProto)
 	fmt.Printf("    - Proxy Mode     (TEST_MODE):       %s\n", testMode)
+	fmt.Printf("    - HTTP Method    (TEST_METHOD):     %s\n", testMethod)
 	if testIntercept != "" {
 		fmt.Printf("    - Interceptor    (TEST_INTERCEPT):  %s\n", testIntercept)
 	}
@@ -125,9 +130,15 @@ func main() {
 	}
 
 	// 4. Fire Request
-	fmt.Printf("\033[1;36m[*] Requesting %s ...\033[0m\n", targetURL)
+	req, err := http.NewRequest(testMethod, targetURL, nil)
+	if err != nil {
+		fmt.Printf("\033[1;31m❌ Failed to create request: %v\033[0m\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("\033[1;36m[*] Requesting %s with %s ...\033[0m\n", targetURL, testMethod)
 	start := time.Now()
-	resp, err := client.Get(targetURL)
+	resp, err := client.Do(req)
 	duration := time.Since(start)
 
 	if err != nil {

@@ -103,10 +103,7 @@ func GetOriginalDst(conn net.Conn) (string, error) {
 	}
 	targetPort := binary.BigEndian.Uint16(nl.Rdxport[:2])
 
-	domain := dns.GlobalPool.GetDomain(targetIP)
-	if domain != "" {
-		return fmt.Sprintf("%s:%d", domain, targetPort), nil
-	}
+	// For Darwin transparent proxy, if we got a real IP and the port is 443, we will let SNI sniffing handle it in handler.go
 	return fmt.Sprintf("%s:%d", targetIP.String(), targetPort), nil
 }
 

@@ -29,6 +29,114 @@ import (
 	"github.com/qtopie/vproxy/socks"
 )
 
+// PeekingConn is a net.Conn that allows peeking into the initial bytes.
+type PeekingConn struct {
+	net.Conn
+	peeked []byte
+	reader io.Reader
+}
+
+func NewPeekingConn(conn net.Conn) *PeekingConn {
+	return &PeekingConn{
+		Conn:   conn,
+		reader: conn,
+	}
+}
+
+func (c *PeekingConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+func (c *PeekingConn) Peek(n int) ([]byte, error) {
+	if len(c.peeked) >= n {
+		return c.peeked[:n], nil
+	}
+	buf := make([]byte, n-len(c.peeked))
+	read, err := io.ReadFull(c.Conn, buf)
+	if read > 0 {
+		c.peeked = append(c.peeked, buf[:read]...)
+		// Update reader to read from peeked buffer first, then underlying conn
+		c.reader = io.MultiReader(bytes.NewReader(c.peeked), c.Conn)
+	}
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return nil, err
+	}
+	if len(c.peeked) < n {
+		return c.peeked, io.ErrUnexpectedEOF
+	}
+	return c.peeked[:n], nil
+}
+
+func sniffSNI(conn *PeekingConn) (string, error) {
+	// TLS ClientHello sniffing logic
+	header, err := conn.Peek(5)
+	if err != nil {
+		return "", err
+	}
+	if header[0] != 22 {
+		return "", fmt.Errorf("not a TLS handshake")
+	}
+
+	length := int(header[3])<<8 | int(header[4])
+	if length > 8192 {
+		return "", fmt.Errorf("TLS record too large")
+	}
+
+	payload, err := conn.Peek(5 + length)
+	if err != nil {
+		return "", err
+	}
+
+	return extractSNIFromPayload(payload[5:])
+}
+
+func extractSNIFromPayload(payload []byte) (string, error) {
+	if len(payload) < 42 {
+		return "", fmt.Errorf("payload too short")
+	}
+	if payload[0] != 1 {
+		return "", fmt.Errorf("not a ClientHello message")
+	}
+
+	sessionIDLen := int(payload[38])
+	offset := 39 + sessionIDLen
+	
+	if offset+2 > len(payload) { return "", fmt.Errorf("invalid ClientHello") }
+	cipherSuitesLen := int(payload[offset])<<8 | int(payload[offset+1])
+	offset += 2 + cipherSuitesLen
+
+	if offset+1 > len(payload) { return "", fmt.Errorf("invalid ClientHello") }
+	compressionMethodsLen := int(payload[offset])
+	offset += 1 + compressionMethodsLen
+
+	if offset+2 > len(payload) { return "", fmt.Errorf("no extensions") }
+	extensionsLen := int(payload[offset])<<8 | int(payload[offset+1])
+	offset += 2
+
+	end := offset + extensionsLen
+	if end > len(payload) {
+		end = len(payload)
+	}
+
+	for offset+4 <= end {
+		extType := int(payload[offset])<<8 | int(payload[offset+1])
+		extLen := int(payload[offset+2])<<8 | int(payload[offset+3])
+		offset += 4
+		
+		if extType == 0 { // Server Name Indication
+			if extLen >= 5 && offset+5 <= end {
+				nameLen := int(payload[offset+3])<<8 | int(payload[offset+4])
+				if offset+5+nameLen <= end {
+					return string(payload[offset+5 : offset+5+nameLen]), nil
+				}
+			}
+			break
+		}
+		offset += extLen
+	}
+	return "", fmt.Errorf("SNI not found")
+}
+
 type ProxyHandler struct {
 	sm             *ServerManager
 	rm             *RuleManager
@@ -826,6 +934,17 @@ func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 					log.Printf("[TUN] Restored Fake-IP %s -> %s", host, domain)
 				}
 			}
+		}
+	}
+
+	// For transparent proxy without Fake-IP or when it failed to resolve via Fake-IP, try SNI sniffing for HTTPS
+	host, port, _ := net.SplitHostPort(target)
+	if net.ParseIP(host) != nil && port == "443" {
+		conn = NewPeekingConn(conn)
+		peekingConn := conn.(*PeekingConn)
+		if domain, err := sniffSNI(peekingConn); err == nil && domain != "" {
+			target = net.JoinHostPort(domain, port)
+			log.Printf("[TUN] Restored domain via SNI sniffing %s -> %s", host, domain)
 		}
 	}
 
