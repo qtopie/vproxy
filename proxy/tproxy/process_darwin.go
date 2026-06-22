@@ -185,6 +185,7 @@ func getPidByPortLSOF(port int) (int, error) {
 		if len(line) > 1 && line[0] == 'p' {
 			pid, err := strconv.Atoi(strings.TrimSpace(line[1:]))
 			if err == nil {
+				log.Printf("[PF] getPidByPort(lsof): port=%d pid=%d", port, pid)
 				return pid, nil
 			}
 		}
@@ -205,10 +206,12 @@ func GetProcessNameByConn(conn interface{}) (string, int, error) {
 
 	pid, err := getPidByPort(remote.Port)
 	if err != nil {
+		log.Printf("[PF] GetProcessNameByConn: no pid for remote port=%d: %v", remote.Port, err)
 		return "", 0, err
 	}
 
 	path, err := procPidPath(pid)
+	log.Printf("[PF] GetProcessNameByConn: remote=%s pid=%d path=%q err=%v", remote, pid, path, err)
 	return path, pid, err
 }
 
