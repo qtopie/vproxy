@@ -255,7 +255,7 @@ proxy_ports = "{ %s }"
 table <private_ips> const { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4, 240.0.0.0/4 }
 
 # --- REDIRECTION (RDR) ---
-# Note: macOS PF rdr rules do NOT support the `user` filter; loop prevention is
+# Note: macOS PF rdr rules do NOT support the 'user' filter option; loop prevention is
 # handled exclusively by the "pass out quick user $vproxy_user" filter rule below.
 rdr pass on lo0 inet proto udp from any to any port 53 -> 127.0.0.1 port %d
 rdr pass on ! lo0 inet proto udp from any to any port 53 -> 127.0.0.1 port %d
