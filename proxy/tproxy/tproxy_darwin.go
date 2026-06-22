@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"strings"
 	"sync"
 	"syscall"
@@ -211,7 +212,20 @@ func StartDarwinTransparent(ctx context.Context, httpPort, socksPort, webPort in
 }
 
 func setupPF(tcpPort, dnsPort, httpPort, socksPort, webPort int) error {
+	// Detect the actual effective user running vproxy for the PF bypass rule.
+	// The PF "pass out quick user $vproxy_user" rule must match the effective
+	// UID of the vproxy process itself (NOT the sudo caller), so that vproxy's
+	// own upstream TCP connections are not re-redirected into the transparent
+	// proxy listener (which would cause an infinite loop).
+	//
+	// When launched via "sudo vproxy init", the daemon process runs as root
+	// (uid=0), so user.Current() correctly returns "root".
+	// When launched without sudo (via capabilities), user.Current() returns
+	// the logged-in user.
 	vproxyUser := "root"
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		vproxyUser = u.Username
+	}
 	confPath := "/tmp/vproxy_pf.conf"
 
 	excludePorts := []string{
@@ -224,27 +238,36 @@ func setupPF(tcpPort, dnsPort, httpPort, socksPort, webPort int) error {
 	routeIface := "! lo0"
 
 	// PF rules to redirect traffic while preserving local/LAN access and avoiding self-loops.
+	// Loop prevention works as follows:
+	//  1. PRIMARY: "pass out quick user $vproxy_user keep state" lets vproxy's own outgoing
+	//     connections bypass the "route-to lo0" steering rule (because `quick` means first-match).
+	//     This prevents vproxy's upstream dials from ever reaching lo0 and being rdr'd back.
+	//  2. SECONDARY: the `user != $vproxy_user` guard on the lo0 rdr rules catches any edge
+	//     cases (e.g., when macOS PF supports user matching in rdr rules).
 	rules := fmt.Sprintf(`
 vproxy_user = "%s"
 proxy_ports = "{ %s }"
 table <private_ips> const { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4, 240.0.0.0/4 }
 
 # --- REDIRECTION (RDR) ---
-rdr pass on lo0 inet proto udp from any to any port 53 -> 127.0.0.1 port %d
+rdr pass on lo0 inet proto udp from any to any port 53 user != $vproxy_user -> 127.0.0.1 port %d
 rdr pass on ! lo0 inet proto udp from any to any port 53 -> 127.0.0.1 port %d
-rdr pass on lo0 inet proto tcp from any to ! <private_ips> -> 127.0.0.1 port %d
+# Redirect TCP on lo0 only for non-vproxy traffic to avoid upstream dial loops
+rdr pass on lo0 inet proto tcp from any to ! <private_ips> user != $vproxy_user -> 127.0.0.1 port %d
 
-# --- BYPASS RULES (Highest Priority) ---
+# --- BYPASS RULES (Highest Priority, applied before route-to steering below) ---
 pass in quick on lo0 all
 pass out quick on lo0 all
 pass out quick proto icmp all keep state
 pass out quick proto icmp6 all keep state
 pass out quick to <private_ips> keep state
 pass in quick from <private_ips> to any keep state
+# PRIMARY loop-prevention: vproxy's own outgoing connections are passed directly,
+# so they are never caught by the route-to lo0 rule below.
 pass out quick user $vproxy_user keep state
 pass out quick inet proto tcp from any to any port $proxy_ports keep state
 
-# --- INTERCEPTION (Steering) ---
+# --- INTERCEPTION (Steering): only for non-vproxy users ---
 pass out on %s route-to lo0 inet proto tcp from any to ! <private_ips> user != $vproxy_user flags S/SA keep state
 pass out on %s route-to lo0 inet proto udp from any to any port 53 user != $vproxy_user keep state
  `, vproxyUser, portList, dnsPort, dnsPort, tcpPort, routeIface, routeIface)
