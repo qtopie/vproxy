@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -174,24 +175,49 @@ func getPidByPortSysctl(targetPort int) (int, error) {
 	return 0, fmt.Errorf("no TCP socket found on local port %d", targetPort)
 }
 
-// getPidByPortLSOF is the original fallback using the lsof utility.
-func getPidByPortLSOF(port int) (int, error) {
-	out, err := exec.Command("lsof", "-nP", fmt.Sprintf("-iTCP:%d", port), "-Fp").Output()
+// getPidByPortLSOF is the fallback using the lsof utility.
+// It returns the PID and also caches the process name to avoid a proc_pidpath call.
+var lsofProcNameCache = struct {
+	sync.Map
+}{}
+
+func getPidAndNameByPortLSOF(port int) (int, string, error) {
+	// Use -Fp (pid) and -Fc (command) output fields
+	out, err := exec.Command("lsof", "-nP", fmt.Sprintf("-iTCP:%d", port), "-Fp", "-Fc").Output()
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	lines := strings.Split(string(out), "\n")
+	var pid int
+	var name string
 	for _, line := range lines {
-		if len(line) > 1 && line[0] == 'p' {
-			pid, err := strconv.Atoi(strings.TrimSpace(line[1:]))
+		if len(line) < 2 {
+			continue
+		}
+		switch line[0] {
+		case 'p':
+			p, err := strconv.Atoi(strings.TrimSpace(line[1:]))
 			if err == nil {
-				log.Printf("[PF] getPidByPort(lsof): port=%d pid=%d", port, pid)
-				return pid, nil
+				pid = p
 			}
+		case 'c':
+			name = strings.TrimSpace(line[1:])
 		}
 	}
-	return 0, fmt.Errorf("not found")
+	if pid > 0 {
+		log.Printf("[PF] getPidByPort(lsof): port=%d pid=%d name=%q", port, pid, name)
+		return pid, name, nil
+	}
+	return 0, "", fmt.Errorf("not found")
 }
+
+func getPidByPortLSOF(port int) (int, error) {
+	pid, _, err := getPidAndNameByPortLSOF(port)
+	return pid, err
+}
+
+
+var procPathCache sync.Map
 
 func GetProcessNameByConn(conn interface{}) (string, int, error) {
 	type remoteAddrIface interface {
@@ -202,7 +228,10 @@ func GetProcessNameByConn(conn interface{}) (string, int, error) {
 		return "", 0, fmt.Errorf("connection does not implement RemoteAddr")
 	}
 
-	remote := c.RemoteAddr().(*net.TCPAddr)
+	remote, ok := c.RemoteAddr().(*net.TCPAddr)
+	if !ok {
+		return "", 0, fmt.Errorf("remote address is not a TCP address")
+	}
 
 	pid, err := getPidByPort(remote.Port)
 	if err != nil {
@@ -215,7 +244,23 @@ func GetProcessNameByConn(conn interface{}) (string, int, error) {
 	return path, pid, err
 }
 
+func getProcessPathByPS(pid int) (string, error) {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "comm=").Output()
+	if err != nil {
+		return "", err
+	}
+	path := strings.TrimSpace(string(out))
+	if path == "" {
+		return "", fmt.Errorf("ps returned empty path for pid %d", pid)
+	}
+	return path, nil
+}
+
 func procPidPath(pid int) (string, error) {
+	if val, ok := procPathCache.Load(pid); ok {
+		return val.(string), nil
+	}
+
 	buf := make([]byte, procPidPathInfoMaxSize)
 	ret, _, errno := syscall.Syscall6(
 		sysProcInfo,
@@ -226,17 +271,27 @@ func procPidPath(pid int) (string, error) {
 		uintptr(unsafe.Pointer(&buf[0])),
 		uintptr(procPidPathInfoMaxSize),
 	)
-	if int(ret) <= 0 {
-		if errno != 0 {
-			return "", errno
+	if int(ret) > 0 {
+		n := bytes.IndexByte(buf, 0)
+		if n < 0 {
+			n = int(ret)
 		}
-		return "", fmt.Errorf("proc_pidpath: no result for pid %d", pid)
+		path := string(buf[:n])
+		procPathCache.Store(pid, path)
+		return path, nil
 	}
-	n := bytes.IndexByte(buf, 0)
-	if n < 0 {
-		n = int(ret)
+
+	// Fallback to ps command
+	path, err := getProcessPathByPS(pid)
+	if err == nil {
+		procPathCache.Store(pid, path)
+		return path, nil
 	}
-	return string(buf[:n]), nil
+
+	if errno != 0 {
+		return "", errno
+	}
+	return "", fmt.Errorf("proc_pidpath: no result for pid %d", pid)
 }
 
 func GetProcessNameByPort(port int) (string, int, error) {
