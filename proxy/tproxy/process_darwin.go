@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"net"
 	"os/exec"
 	"strconv"
@@ -99,9 +100,15 @@ const (
 func getPidByPort(port int) (int, error) {
 	pid, err := getPidByPortSysctl(port)
 	if err == nil {
+		log.Printf("[PF] getPidByPort(sysctl): port=%d pid=%d", port, pid)
 		return pid, nil
 	}
-	return getPidByPortLSOF(port)
+	log.Printf("[PF] getPidByPort(sysctl) miss for port=%d: %v, falling back to lsof", port, err)
+	pid, err = getPidByPortLSOF(port)
+	if err != nil {
+		log.Printf("[PF] getPidByPort(lsof) miss for port=%d: %v", port, err)
+	}
+	return pid, err
 }
 
 // getPidByPortSysctl implements the fast path using sysctl net.inet.tcp.pcblist_n.
@@ -123,10 +130,14 @@ func getPidByPortSysctl(targetPort int) (int, error) {
 		return 0, fmt.Errorf("sysctl net.inet.tcp.pcblist_n: %w", err)
 	}
 
-	// Skip the leading xinpgen header (16 bytes).
-	const xinpgenSize = 16
-	if len(buf) < xinpgenSize {
+	// The xinpgen header is self-describing: its first uint32 is its own byte length.
+	// On macOS 26.5.1 the header is 24 bytes (not the 16 assumed in older XNU headers).
+	if len(buf) < 4 {
 		return 0, fmt.Errorf("pcblist_n buffer too small (%d bytes)", len(buf))
+	}
+	xinpgenSize := int(binary.LittleEndian.Uint32(buf[0:4]))
+	if xinpgenSize < 8 || xinpgenSize > len(buf) {
+		return 0, fmt.Errorf("pcblist_n xinpgen size %d out of range", xinpgenSize)
 	}
 	buf = buf[xinpgenSize:]
 
