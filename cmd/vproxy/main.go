@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	vlink "github.com/qtopie/vproxy/internal"
@@ -74,9 +73,7 @@ func main() {
 		return
 
 	case "clean":
-		if os.Geteuid() != 0 {
-			vlink.Fatal("'clean' command requires sudo privileges")
-		}
+		requireElevatedPrivileges("clean")
 		stopBackgroundServer()
 		vlink.SetVerbose(*verbose)
 		tproxy.Cleanup()
@@ -89,9 +86,7 @@ func main() {
 		return
 
 	case "init":
-		if os.Geteuid() != 0 {
-			vlink.Fatal("'init' command requires sudo privileges")
-		}
+		requireElevatedPrivileges("init")
 
 		// Fail fast: verify configuration exists and is valid before starting daemon
 		_, resolvedPath, err := vlink.LoadConfig(*configPath)
@@ -101,17 +96,7 @@ func main() {
 
 		binary, err := os.Executable()
 		if err == nil {
-			sudoUser := os.Getenv("SUDO_USER")
-			if sudoUser == "" {
-				sudoUser = "root"
-			}
-
-			fmt.Printf("vproxy: Setting up BPF capabilities for binary %s\n", binary)
-			exec.Command("setcap", "cap_net_admin,cap_net_bind_service,cap_bpf,cap_sys_resource+ep", binary).Run()
-
-			fmt.Println("vproxy: Setting up cgroups directory /sys/fs/cgroup/vproxy")
-			exec.Command("mkdir", "-p", "/sys/fs/cgroup/vproxy").Run()
-			exec.Command("chown", "-R", sudoUser, "/sys/fs/cgroup/vproxy").Run()
+			performPrivilegedInitSetup(binary)
 		}
 
 		startBackgroundServer(resolvedPath, pidFile)
@@ -188,7 +173,7 @@ func printUsage() {
 	fmt.Println("  init          Perform privileged setup and start background daemon")
 	fmt.Println("  stop          Stop the background daemon")
 	fmt.Println("  status        Display current server status")
-	fmt.Println("  clean         Clean up environment and stop daemon (requires sudo)")
+	fmt.Println("  clean         Clean up environment and stop daemon (requires elevation)")
 	fmt.Println("  <cmd> [args]  Run an external command through vproxy (e.g., vproxy curl ...)")
 	fmt.Println("\nOptions:")
 	flag.PrintDefaults()
@@ -212,13 +197,13 @@ func startBackgroundServer(config, pidFile string) {
 	cmd := exec.Command(binary, bgArgs...)
 	// Inherit environment but set a marker
 	cmd.Env = append(os.Environ(), "VP_BACKGROUND=1")
-	
+
 	// Open log file for background process in the system temp directory so it can be inspected
 	logFile := filepath.Join(os.TempDir(), "vproxy.log")
 	f, _ := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	cmd.Stdout = f
 	cmd.Stderr = f
-	
+
 	err := cmd.Start()
 	if err != nil {
 		vlink.Fatalf("Failed to start background server: %v", err)
@@ -238,7 +223,7 @@ func stopBackgroundServer() {
 	pid, _ := strconv.Atoi(string(data))
 	process, err := os.FindProcess(pid)
 	if err == nil {
-		process.Signal(syscall.SIGTERM)
+		stopProcess(process)
 		// Wait a bit for cleanup
 		time.Sleep(1 * time.Second)
 	}
