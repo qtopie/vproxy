@@ -8,3 +8,5 @@ proxy/ebpf/bpf_bpfel.go
 proxy/ebpf/tc_bpf_bpfel.go
 .antigravitycli/
 !.github/workflows/
+
+.agents/TASK.md
