@@ -159,8 +159,10 @@ func NewRuleManager(ruleEntries []string) *RuleManager {
 			ruleType = RuleTypeDomain
 		case "PROCESS":
 			ruleType = RuleTypeProcess
-		case "URL":
+		case "URL", "MAP":
 			ruleType = RuleTypeURL
+		case "INTERCEPT":
+			ruleType = RuleTypeDomain
 		default:
 			// Fallback to domain if it's not a known type
 			ruleType = RuleTypeDomain

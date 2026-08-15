@@ -43,7 +43,7 @@ func TestMITMHTTPS(t *testing.T) {
 	// Using a wildcard rule to route the target through direct dial
 	sm := NewServerManager([]string{}, 1*time.Minute, 1*time.Second)
 	rm := NewRuleManager([]string{fmt.Sprintf("%s,DIRECT", targetURL.Hostname())})
-	ph := NewProxyHandler(sm, rm, 0, 0, 0) // Use 0 for dynamic ports
+	ph := NewProxyHandler(sm, rm, 0, 0, 0, 0) // Use 0 for dynamic ports
 
 	if err := ph.StartHTTP(); err != nil {
 		t.Fatalf("Failed to start HTTP proxy: %v", err)
