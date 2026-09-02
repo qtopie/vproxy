@@ -228,6 +228,7 @@ func stopBackgroundServer() {
 		time.Sleep(1 * time.Second)
 	}
 	os.Remove(pidFile)
+	tproxy.Cleanup()
 }
 
 func ensureProcessInConfig(path string, cfg *vlink.Config, proc string) {

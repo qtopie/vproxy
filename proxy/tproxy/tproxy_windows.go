@@ -35,10 +35,11 @@ var (
 	winIPStack   *stack.Stack
 	winMu        sync.Mutex
 
-	// iphlpapi.dll — routing and TCP table queries
+	// iphlpapi.dll — routing and TCP/UDP table queries
 	modIphlpapi             = windows.NewLazySystemDLL("iphlpapi.dll")
 	procGetBestInterface    = modIphlpapi.NewProc("GetBestInterface")
 	procGetExtendedTcpTable = modIphlpapi.NewProc("GetExtendedTcpTable")
+	procGetExtendedUdpTable = modIphlpapi.NewProc("GetExtendedUdpTable")
 
 	// ws2_32.dll — raw setsockopt (Go's syscall doesn't expose SetsockoptInt on Windows)
 	modWs2_32      = windows.NewLazySystemDLL("ws2_32.dll")
@@ -111,6 +112,12 @@ func StartWindowsTransparent(ctx context.Context, tcpHandler func(net.Conn), udp
 	}
 
 	// 1. Create TUN device backed by the Wintun kernel driver.
+	if h, err := windows.LoadLibrary("wintun.dll"); err != nil {
+		return fmt.Errorf("wintun.dll not found: please download wintun.dll from https://www.wintun.net/ and place it in the same directory as vproxy.exe or in C:\\Windows\\System32 (%w)", err)
+	} else {
+		windows.FreeLibrary(h)
+	}
+
 	dev, err := tun.CreateTUN("vproxy-tun", 1500)
 	if err != nil {
 		return fmt.Errorf("failed to create TUN device: %v (run as Administrator and ensure Wintun is installed)", err)
@@ -305,9 +312,12 @@ func setupRoutingWindows(tunName string) error {
 func Cleanup() {
 	winMu.Lock()
 	defer winMu.Unlock()
+	// Always delete the split routes unconditionally to restore internet connectivity,
+	// even if called from a separate CLI process (e.g., 'vproxy clean' or 'vproxy stop')
+	// where winTunDevice is nil.
+	_ = exec.Command("route", "delete", "0.0.0.0", "mask", "128.0.0.0").Run()
+	_ = exec.Command("route", "delete", "128.0.0.0", "mask", "128.0.0.0").Run()
 	if winTunDevice != nil {
-		exec.Command("route", "delete", "0.0.0.0", "mask", "128.0.0.0").Run()
-		exec.Command("route", "delete", "128.0.0.0", "mask", "128.0.0.0").Run()
 		winTunDevice.Close()
 		winTunDevice = nil
 	}

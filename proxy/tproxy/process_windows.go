@@ -26,38 +26,95 @@ type mibTCPRowOwnerPID struct {
 	OwningPID  uint32
 }
 
-const tcpTableOwnerPIDAll = 5
+// mibUDPRowOwnerPID mirrors MIB_UDPROW_OWNER_PID from iphlpapi.h.
+type mibUDPRowOwnerPID struct {
+	LocalAddr uint32
+	LocalPort uint32 // big-endian uint16 stored in lower 16 bits of uint32
+	OwningPID uint32
+}
 
-// getPidByPort calls GetExtendedTcpTable to find the PID that owns the given local port.
-func getPidByPort(port int) (int, error) {
-	// First call with nil buffer to obtain the required buffer size.
+const (
+	tcpTableOwnerPIDAll = 5
+	udpTableOwnerPID    = 1
+)
+
+// getPidByTCPPort calls GetExtendedTcpTable to find the PID that owns the given local TCP port.
+func getPidByTCPPort(port int) (int, error) {
 	var size uint32
-	procGetExtendedTcpTable.Call(0, uintptr(unsafe.Pointer(&size)), 0, windows.AF_INET, tcpTableOwnerPIDAll, 0)
-
-	buf := make([]byte, size+16) // add slack to handle TOCTOU growth
-	ret, _, _ := procGetExtendedTcpTable.Call(
-		uintptr(unsafe.Pointer(&buf[0])),
-		uintptr(unsafe.Pointer(&size)),
-		1, // bOrder: sort by local address
-		windows.AF_INET,
-		tcpTableOwnerPIDAll,
-		0,
-	)
-	if ret != 0 {
-		return 0, fmt.Errorf("GetExtendedTcpTable: error %d", ret)
-	}
-
-	numEntries := *(*uint32)(unsafe.Pointer(&buf[0]))
-	rowSize := unsafe.Sizeof(mibTCPRowOwnerPID{})
-	for i := uint32(0); i < numEntries; i++ {
-		row := (*mibTCPRowOwnerPID)(unsafe.Pointer(&buf[4+uintptr(i)*rowSize]))
-		// LocalPort is stored big-endian: swap the two low bytes to get host order.
-		localPort := int(((row.LocalPort & 0xff) << 8) | ((row.LocalPort >> 8) & 0xff))
-		if localPort == port {
-			return int(row.OwningPID), nil
+	// Retry loop to handle TOCTOU table growth
+	for attempts := 0; attempts < 3; attempts++ {
+		procGetExtendedTcpTable.Call(0, uintptr(unsafe.Pointer(&size)), 0, windows.AF_INET, tcpTableOwnerPIDAll, 0)
+		if size == 0 {
+			break
+		}
+		buf := make([]byte, size+128)
+		ret, _, _ := procGetExtendedTcpTable.Call(
+			uintptr(unsafe.Pointer(&buf[0])),
+			uintptr(unsafe.Pointer(&size)),
+			1, // bOrder: sort by local address
+			windows.AF_INET,
+			tcpTableOwnerPIDAll,
+			0,
+		)
+		if ret == 0 {
+			numEntries := *(*uint32)(unsafe.Pointer(&buf[0]))
+			rowSize := unsafe.Sizeof(mibTCPRowOwnerPID{})
+			for i := uint32(0); i < numEntries; i++ {
+				row := (*mibTCPRowOwnerPID)(unsafe.Pointer(&buf[4+uintptr(i)*rowSize]))
+				localPort := int(((row.LocalPort & 0xff) << 8) | ((row.LocalPort >> 8) & 0xff))
+				if localPort == port {
+					return int(row.OwningPID), nil
+				}
+			}
+			return 0, fmt.Errorf("process not found for TCP port %d", port)
+		}
+		if ret != uintptr(windows.ERROR_INSUFFICIENT_BUFFER) {
+			return 0, fmt.Errorf("GetExtendedTcpTable: error %d", ret)
 		}
 	}
-	return 0, fmt.Errorf("process not found for port %d", port)
+	return 0, fmt.Errorf("process not found for TCP port %d", port)
+}
+
+// getPidByUDPPort calls GetExtendedUdpTable to find the PID that owns the given local UDP port.
+func getPidByUDPPort(port int) (int, error) {
+	var size uint32
+	// Retry loop to handle TOCTOU table growth
+	for attempts := 0; attempts < 3; attempts++ {
+		procGetExtendedUdpTable.Call(0, uintptr(unsafe.Pointer(&size)), 0, windows.AF_INET, udpTableOwnerPID, 0)
+		if size == 0 {
+			break
+		}
+		buf := make([]byte, size+128)
+		ret, _, _ := procGetExtendedUdpTable.Call(
+			uintptr(unsafe.Pointer(&buf[0])),
+			uintptr(unsafe.Pointer(&size)),
+			1, // bOrder: sort by local address
+			windows.AF_INET,
+			udpTableOwnerPID,
+			0,
+		)
+		if ret == 0 {
+			numEntries := *(*uint32)(unsafe.Pointer(&buf[0]))
+			rowSize := unsafe.Sizeof(mibUDPRowOwnerPID{})
+			for i := uint32(0); i < numEntries; i++ {
+				row := (*mibUDPRowOwnerPID)(unsafe.Pointer(&buf[4+uintptr(i)*rowSize]))
+				localPort := int(((row.LocalPort & 0xff) << 8) | ((row.LocalPort >> 8) & 0xff))
+				if localPort == port {
+					return int(row.OwningPID), nil
+				}
+			}
+			return 0, fmt.Errorf("process not found for UDP port %d", port)
+		}
+		if ret != uintptr(windows.ERROR_INSUFFICIENT_BUFFER) {
+			return 0, fmt.Errorf("GetExtendedUdpTable: error %d", ret)
+		}
+	}
+	return 0, fmt.Errorf("process not found for UDP port %d", port)
+}
+
+// getPidByPort is an alias for getPidByTCPPort for backwards compatibility.
+func getPidByPort(port int) (int, error) {
+	return getPidByTCPPort(port)
 }
 
 // getProcessPath returns the full Win32 path of the executable for the given PID
@@ -90,7 +147,21 @@ func getProcessPath(pid int) (string, error) {
 // substring, so PROCESS rules work with both short names ("Telegram") and full
 // paths ("C:\Program Files\Telegram Desktop").
 func GetProcessNameByPort(port int) (string, int, error) {
-	pid, err := getPidByPort(port)
+	pid, err := getPidByTCPPort(port)
+	if err != nil {
+		return "", 0, err
+	}
+	path, err := getProcessPath(pid)
+	if err != nil {
+		return "", 0, err
+	}
+	return path, pid, nil
+}
+
+// GetProcessNameByUDPPort returns the full executable path of the process bound to
+// the given local UDP port.
+func GetProcessNameByUDPPort(port int) (string, int, error) {
+	pid, err := getPidByUDPPort(port)
 	if err != nil {
 		return "", 0, err
 	}
@@ -115,7 +186,7 @@ func GetProcessNameByConn(conn interface{}) (string, int, error) {
 	case *net.TCPAddr:
 		return GetProcessNameByPort(addr.Port)
 	case *net.UDPAddr:
-		return GetProcessNameByPort(addr.Port)
+		return GetProcessNameByUDPPort(addr.Port)
 	}
 	return "", 0, fmt.Errorf("unsupported address type")
 }
