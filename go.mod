@@ -21,3 +21,5 @@ require (
 )
 
 replace gvisor.dev/gvisor => github.com/google/gvisor v0.0.0-20260519190036-266ba6c868f3
+
+replace golang.zx2c4.com/wintun => ./third_party/wintun

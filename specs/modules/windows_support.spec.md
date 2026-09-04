@@ -6,6 +6,8 @@
 ## 2. Interface / API Contract
 - **`tproxy.Cleanup()`**: 移除 Windows 注入的 `0.0.0.0/1` 与 `128.0.0.0/1` 路由，并释放 Wintun 句柄。
 - **`tproxy.GetProcessNameByConn(conn interface{}) (string, int, error)`**: 支持从 TCP/UDP 连接中提取远程地址（应用端源端口），并在 Windows 系统内核表中反查对应的 PID 及可执行文件完整路径。
+- **Windows TUN startup health**: `vproxy init` must not report success until the background server has completed Wintun/TUN initialization and routing setup; initialization errors must be surfaced and must not leave interception routes installed.
+- **Windows TUN routing safety**: Wintun creation, gVisor stack setup, and both `/1` route additions are transactional. Any failure must remove routes, close the TUN device, and leave the host on its original route configuration.
 
 ## 3. Acceptance Criteria (BDD)
 
@@ -24,3 +26,17 @@
 - **When** 调用 `GetProcessNameByConn` 传入 `*net.UDPAddr`
 - **Then** 正确通过 `GetExtendedUdpTable` 查询到对应进程的 PID 并提取出可执行文件路径
 - **Mapped Test:** `proxy/tproxy/process_windows_test.go:TestWindows_GetProcessNameByUDPPort`
+
+### Feature: Windows TUN startup failure handling
+
+#### Scenario 3: [SPEC-WIN-003] TUN 初始化失败不得伪装为成功
+- **Given** Wintun is unavailable, incompatible, or fails while creating the adapter or configuring routes
+- **When** the user runs `vproxy init`
+- **Then** `init` reports a failure or startup timeout, the failure is logged with the underlying cause, and no `/1` interception routes remain installed
+- **Mapped Test:** `cmd/vproxy` startup-health tests and `proxy/tproxy` routing rollback tests
+
+#### Scenario 4: [SPEC-WIN-004] TUN 初始化成功后才允许流量验证
+- **Given** Wintun and the gVisor stack are initialized successfully
+- **When** `vproxy init` returns success
+- **Then** the daemon is ready to accept intercepted traffic and the caller may run the required timed DNS, TCP/443, and HTTPS checks followed by mandatory `vproxy clean`
+- **Mapped Test:** Windows integration harness

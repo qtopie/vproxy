@@ -10,11 +10,15 @@ import (
 	"log"
 	"net"
 	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/qtopie/vproxy/internal/dns"
+	"github.com/qtopie/vproxy/internal/wintunruntime"
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/tun"
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -98,7 +102,17 @@ func ReadFromUDPWithOrigDst(conn *net.UDPConn, b, oob []byte) (int, *net.UDPAddr
 // StartWindowsTransparent is the entry point for the Windows transparent proxy.
 // It creates a Wintun TUN device, sets up a gvisor userspace TCP/IP stack,
 // and configures split routing so all traffic is intercepted.
-func StartWindowsTransparent(ctx context.Context, tcpHandler func(net.Conn), udpHandler func(context.Context, net.Conn, string)) error {
+func StartWindowsTransparent(ctx context.Context, tcpHandler func(net.Conn), udpHandler func(context.Context, net.Conn, string)) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			cleanupWindowsState()
+			err = fmt.Errorf("panic while initializing Wintun/TUN: %v", r)
+		}
+		if err != nil {
+			cleanupWindowsState()
+		}
+	}()
+
 	winMu.Lock()
 	defer winMu.Unlock()
 
@@ -112,8 +126,13 @@ func StartWindowsTransparent(ctx context.Context, tcpHandler func(net.Conn), udp
 	}
 
 	// 1. Create TUN device backed by the Wintun kernel driver.
+	dllPath, err := wintunruntime.Ensure()
+	if err != nil {
+		return err
+	}
+	log.Printf("[TUN/W] Using bundled Wintun runtime: %s", dllPath)
 	if h, err := windows.LoadLibrary("wintun.dll"); err != nil {
-		return fmt.Errorf("wintun.dll not found: please download wintun.dll from https://www.wintun.net/ and place it in the same directory as vproxy.exe or in C:\\Windows\\System32 (%w)", err)
+		return fmt.Errorf("bundled Wintun 0.14.1 could not be loaded: %w", err)
 	} else {
 		windows.FreeLibrary(h)
 	}
@@ -288,30 +307,57 @@ func bridgeTunWindows(dev tun.Device, ep *channel.Endpoint) {
 // setupRoutingWindows assigns an IP to the Wintun adapter and adds two /1 routes
 // that capture all internet traffic through the TUN without replacing the default route.
 func setupRoutingWindows(tunName string) error {
+	interfaceID, err := findWindowsInterfaceIndex(tunName)
+	if err != nil {
+		return err
+	}
+
 	// Assign a static IP to the TUN interface.
-	if out, err := exec.Command("netsh", "interface", "ip", "set", "address",
-		fmt.Sprintf("name=%s", tunName), "static", "198.18.0.1", "255.255.0.0",
+	if out, err := exec.Command("netsh", "interface", "ipv4", "set", "address",
+		"interface="+interfaceID, "source=static", "address=198.18.0.1", "mask=255.254.0.0",
 	).CombinedOutput(); err != nil {
 		log.Printf("[TUN/W] Warning: netsh set address: %v: %s", err, out)
 	}
 
 	// Two /1 routes have longer prefix than the default /0, capturing all traffic.
 	routes := [][]string{
-		{"route", "add", "0.0.0.0", "mask", "128.0.0.0", "198.18.0.1", "metric", "1"},
-		{"route", "add", "128.0.0.0", "mask", "128.0.0.0", "198.18.0.1", "metric", "1"},
+		{"netsh", "interface", "ipv4", "add", "route", "prefix=0.0.0.0/1", "interface=" + interfaceID, "metric=1", "store=active"},
+		{"netsh", "interface", "ipv4", "add", "route", "prefix=128.0.0.0/1", "interface=" + interfaceID, "metric=1", "store=active"},
 	}
 	for _, args := range routes {
 		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
-			log.Printf("[TUN/W] Warning: %v: %s", args, out)
+			return fmt.Errorf("add route %v: %w: %s", args, err, out)
 		}
 	}
 	return nil
+}
+
+func findWindowsInterfaceIndex(tunName string) (string, error) {
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		if tunInterface, err := net.InterfaceByName(tunName); err == nil {
+			return strconv.Itoa(tunInterface.Index), nil
+		}
+
+		script := fmt.Sprintf(`$a = Get-NetAdapter -IncludeHidden | Where-Object { $_.Name -eq '%s' -or $_.InterfaceDescription -like '*Wintun*' } | Select-Object -First 1; if ($a) { $a.ifIndex }`, tunName)
+		out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script).CombinedOutput()
+		if err == nil {
+			if index := strings.TrimSpace(string(out)); index != "" {
+				return index, nil
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return "", fmt.Errorf("find hidden Windows TUN interface %q", tunName)
 }
 
 // Cleanup removes the TUN routes and closes the Wintun device.
 func Cleanup() {
 	winMu.Lock()
 	defer winMu.Unlock()
+	cleanupWindowsState()
+}
+
+func cleanupWindowsState() {
 	// Always delete the split routes unconditionally to restore internet connectivity,
 	// even if called from a separate CLI process (e.g., 'vproxy clean' or 'vproxy stop')
 	// where winTunDevice is nil.

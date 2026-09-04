@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -99,7 +100,9 @@ func main() {
 			performPrivilegedInitSetup(binary)
 		}
 
-		startBackgroundServer(resolvedPath, pidFile)
+		if err := startBackgroundServer(resolvedPath, pidFile); err != nil {
+			vlink.Fatalf("init failed: %v", err)
+		}
 		return
 
 	case "start":
@@ -179,11 +182,11 @@ func printUsage() {
 	flag.PrintDefaults()
 }
 
-func startBackgroundServer(config, pidFile string) {
+func startBackgroundServer(config, pidFile string) error {
 	// Check if already running
 	if _, err := os.Stat(pidFile); err == nil {
 		fmt.Fprintln(os.Stderr, "vproxy is already running. Run 'vproxy clean' first if you want to restart.")
-		return
+		return nil
 	}
 
 	binary, _ := os.Executable()
@@ -194,9 +197,11 @@ func startBackgroundServer(config, pidFile string) {
 	if *verbose {
 		bgArgs = append(bgArgs, "-v")
 	}
+	readyFile := filepath.Join(os.TempDir(), fmt.Sprintf("vproxy-ready-%d", time.Now().UnixNano()))
+	_ = os.Remove(readyFile)
 	cmd := exec.Command(binary, bgArgs...)
 	// Inherit environment but set a marker
-	cmd.Env = append(os.Environ(), "VP_BACKGROUND=1")
+	cmd.Env = append(os.Environ(), "VP_BACKGROUND=1", "VP_READY_FILE="+readyFile)
 
 	// Open log file for background process in the system temp directory so it can be inspected
 	logFile := filepath.Join(os.TempDir(), "vproxy.log")
@@ -206,12 +211,55 @@ func startBackgroundServer(config, pidFile string) {
 
 	err := cmd.Start()
 	if err != nil {
-		vlink.Fatalf("Failed to start background server: %v", err)
+		return fmt.Errorf("failed to start background server: %w", err)
 	}
 
 	os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", cmd.Process.Pid)), 0644)
 	fmt.Fprintf(os.Stderr, "vproxy: started in background (PID: %d, Log: %s)\n", cmd.Process.Pid, logFile)
-	fmt.Fprintln(os.Stderr, "vproxy: TUN environment initialized.")
+	if runtime.GOOS != "windows" {
+		fmt.Fprintln(os.Stderr, "vproxy: environment initialized.")
+		return nil
+	}
+
+	exitCh := make(chan error, 1)
+	go func() {
+		exitCh <- cmd.Wait()
+	}()
+	startupTimeout := 15 * time.Second
+	if err := waitForReadyFile(readyFile, startupTimeout, func() bool {
+		select {
+		case exitErr := <-exitCh:
+			exitCh <- exitErr
+			return false
+		default:
+			return true
+		}
+	}); err != nil {
+		_ = cmd.Process.Kill()
+		<-exitCh
+		_ = os.Remove(pidFile)
+		tproxy.Cleanup()
+		return fmt.Errorf("background server did not become ready within %s: %w", startupTimeout, err)
+	}
+	_ = os.Remove(readyFile)
+	fmt.Fprintln(os.Stderr, "vproxy: TUN environment initialized and ready.")
+	return nil
+}
+
+func waitForReadyFile(path string, timeout time.Duration, processAlive func() bool) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		}
+		if !processAlive() {
+			return fmt.Errorf("background server exited before signaling readiness")
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("readiness file was not created")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func stopBackgroundServer() {

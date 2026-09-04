@@ -26,7 +26,7 @@ type App struct {
 	LocalSocks int
 	LocalHTTP  int
 	LocalTrans int
-	
+
 	ebpfResult *ebpf.LoadResult // Strong reference to prevent GC of eBPF FDs
 	ipcServer  *ipc.Server
 	ph         *ProxyHandler
@@ -112,7 +112,7 @@ func (a *App) SelfHeal() error {
 	if err := iptables.SetupRules(setupTarget, isRemoteTProxy, upstreamIP, upstreamPort); err != nil {
 		return fmt.Errorf("iptables setup failed: %v", err)
 	}
-	
+
 	Infof("iptables redirect active (system-wide)")
 	ebpf.SetEnabled(true)
 	SetDialerControl(ebpf.GetDialerControl())
@@ -175,6 +175,13 @@ func (a *App) RunServer() {
 	// On Linux, if transparent proxy is enabled, we need to setup the global redirection rules
 	if err := a.SelfHeal(); err != nil {
 		Fatalf("Initialization failed: %v. Please run 'sudo vproxy init' to set up capabilities.", err)
+	}
+	if runtime.GOOS == "windows" {
+		if readyFile := os.Getenv("VP_READY_FILE"); readyFile != "" {
+			if err := os.WriteFile(readyFile, []byte("ready\n"), 0600); err != nil {
+				Fatalf("failed to signal startup readiness: %v", err)
+			}
+		}
 	}
 
 	a.printVerboseStatus(ph, sm, a.ebpfResult != nil, isUpstreamTProxyAlive, best)
@@ -267,10 +274,10 @@ func (a *App) RunWrapper(args []string) {
 		if err := cmd.Start(); err != nil {
 			Fatalf("Command execution failed: %v", err)
 		}
-		
+
 		// Dynamic PID rule injection for surgical proxying
 		Debugf("Dynamic PID rule injected for %d (PROXY)", cmd.Process.Pid)
-		
+
 		if err := cmd.Wait(); err != nil {
 			if exitErr, ok := err.(*exec.ExitError); ok {
 				os.Exit(exitErr.ExitCode())
@@ -339,7 +346,7 @@ func (a *App) RunWrapper(args []string) {
 			Debugf("Direct cgroup migration failed (%v), trying IPC attach...", err)
 			if ipcErr := ipc.RequestAttach(os.Getpid()); ipcErr != nil {
 				Debugf("IPC attach failed: %v", ipcErr)
-				
+
 				// TRIGGER SELF-HEAL: If IPC attach fails, the environment might be tampered.
 				// Request the daemon to repair itself.
 				if skipPrivileged {
@@ -367,7 +374,7 @@ func (a *App) RunWrapper(args []string) {
 		} else {
 			Debugf("Successfully moved process %d (%s) to vproxy cgroup via direct write", os.Getpid(), cmdName)
 		}
-		
+
 		// If we're on Linux, we also need to ensure SO_MARK is set for our own bridges
 		ebpf.SetEnabled(true)
 		SetDialerControl(ebpf.GetDialerControl())
@@ -401,10 +408,10 @@ func (a *App) RunWrapper(args []string) {
 				}
 				setupTarget = fmt.Sprintf("%d", ph.TransPort)
 			} else {
-				// If background server is running, we don't need to start a local bridge 
+				// If background server is running, we don't need to start a local bridge
 				// or setup iptables rules here. The background server handles it.
 				Debugf("Background vproxy handles transparent proxying, skipping local bridge/iptables setup")
-				needsEbpf = false 
+				needsEbpf = false
 			}
 		}
 
@@ -473,7 +480,7 @@ func (a *App) RunWrapper(args []string) {
 		}
 	}
 
-	// If background vproxy is running and this tool needs transparent proxying, 
+	// If background vproxy is running and this tool needs transparent proxying,
 	// we don't need to set environment variables or start bridges because TUN/iptables/eBPF will intercept it.
 	// For tools that use env-vars (needsEbpf=false), we always proceed to set them.
 	if (skipPrivileged || needsTransparent) && needsEbpf {
@@ -503,7 +510,7 @@ func (a *App) RunWrapper(args []string) {
 	baseName = filepath.Base(cmdName)
 	switch baseName {
 	case "curl", "git", "gemini":
-		// 'agy' is excluded here to ensure it doesn't get HTTP_PROXY env vars 
+		// 'agy' is excluded here to ensure it doesn't get HTTP_PROXY env vars
 		// that might conflict with its transparent proxying requirement.
 		isHTTPTool = true
 	default:

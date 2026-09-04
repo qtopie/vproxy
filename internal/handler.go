@@ -100,16 +100,22 @@ func extractSNIFromPayload(payload []byte) (string, error) {
 
 	sessionIDLen := int(payload[38])
 	offset := 39 + sessionIDLen
-	
-	if offset+2 > len(payload) { return "", fmt.Errorf("invalid ClientHello") }
+
+	if offset+2 > len(payload) {
+		return "", fmt.Errorf("invalid ClientHello")
+	}
 	cipherSuitesLen := int(payload[offset])<<8 | int(payload[offset+1])
 	offset += 2 + cipherSuitesLen
 
-	if offset+1 > len(payload) { return "", fmt.Errorf("invalid ClientHello") }
+	if offset+1 > len(payload) {
+		return "", fmt.Errorf("invalid ClientHello")
+	}
 	compressionMethodsLen := int(payload[offset])
 	offset += 1 + compressionMethodsLen
 
-	if offset+2 > len(payload) { return "", fmt.Errorf("no extensions") }
+	if offset+2 > len(payload) {
+		return "", fmt.Errorf("no extensions")
+	}
 	extensionsLen := int(payload[offset])<<8 | int(payload[offset+1])
 	offset += 2
 
@@ -122,7 +128,7 @@ func extractSNIFromPayload(payload []byte) (string, error) {
 		extType := int(payload[offset])<<8 | int(payload[offset+1])
 		extLen := int(payload[offset+2])<<8 | int(payload[offset+3])
 		offset += 4
-		
+
 		if extType == 0 { // Server Name Indication
 			if extLen >= 5 && offset+5 <= end {
 				nameLen := int(payload[offset+3])<<8 | int(payload[offset+4])
@@ -251,21 +257,15 @@ func (ph *ProxyHandler) StartTransparent() error {
 
 	if runtime.GOOS == "windows" {
 		SetDialerControl(tproxy.GetDialerControl())
-		go func() {
-			err := tproxy.StartWindowsTransparent(context.Background(), func(conn net.Conn) {
-				defer conn.Close()
-				target, err := tproxy.GetOriginalDst(conn)
-				if err != nil {
-					log.Printf("Failed to get original destination: %v", err)
-					return
-				}
-				ph.forward(conn, target)
-			}, ph.handleUDP)
+		return tproxy.StartWindowsTransparent(context.Background(), func(conn net.Conn) {
+			defer conn.Close()
+			target, err := tproxy.GetOriginalDst(conn)
 			if err != nil {
-				log.Printf("Failed to start Windows transparent proxy: %v", err)
+				log.Printf("Failed to get original destination: %v", err)
+				return
 			}
-		}()
-		return nil
+			ph.forward(conn, target)
+		}, ph.handleUDP)
 	}
 
 	if runtime.GOOS == "linux" && os.Getenv("VP_USE_TUN") == "1" {
