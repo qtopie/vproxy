@@ -44,7 +44,7 @@ func Relay(ctx context.Context, left, right net.Conn) error {
 }
 
 func closeWrite(conn net.Conn) {
-	if tcpConn, ok := conn.(*net.TCPConn); ok {
+	if tcpConn, ok := conn.(interface{ CloseWrite() error }); ok {
 		_ = tcpConn.CloseWrite()
 		return
 	}

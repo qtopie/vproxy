@@ -75,9 +75,9 @@
 
 #### Scenario 8: [SPEC-WIN-008] Windows TUN preserves inbound TCP payloads
 - **Given** a TCP connection is accepted by the Windows gVisor TUN stack
-- **When** Wintun delivers packets with hardware checksum offload metadata or incomplete software checksums
-- **Then** the bridge marks the inbound packet checksum as validated before injecting it into gVisor
-- **And** the channel endpoint advertises receive checksum offload capability
+- **When** Wintun delivers an IPv4 or IPv6 packet to the userspace bridge
+- **Then** the bridge does not claim checksum validation or hardware offload for that packet
+- **And** gVisor validates inbound transport checksums before delivering payloads
 - **And** a native `curl.exe` HTTPS request can exchange request and response payloads after the upstream tunnel is established
 - **Mapped Test:** Windows TUN relay integration harness using `curl.exe -v`
 

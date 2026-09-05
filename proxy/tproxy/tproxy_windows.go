@@ -180,7 +180,6 @@ func StartWindowsTransparent(ctx context.Context, upstreams []string, bypassNode
 	winIPStack = s
 
 	chanEP := channel.New(256, 1500, "")
-	chanEP.LinkEPCapabilities = stack.CapabilityRXChecksumOffload
 	if tcpipErr := s.CreateNIC(1, chanEP); tcpipErr != nil {
 		return fmt.Errorf("CreateNIC: %v", tcpipErr)
 	}
@@ -317,7 +316,6 @@ func bridgeTunWindows(dev tun.Device, ep *channel.Endpoint) {
 				pb := stack.NewPacketBuffer(stack.PacketBufferOptions{
 					Payload: buffer.MakeWithData(pktBuf),
 				})
-				pb.RXChecksumValidated = true
 				proto := tcpip.NetworkProtocolNumber(ipv4.ProtocolNumber)
 				if (pktBuf[0] >> 4) == 6 {
 					proto = ipv6.ProtocolNumber
