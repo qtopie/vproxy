@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/netip"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -37,6 +38,7 @@ import (
 var (
 	winTunDevice tun.Device
 	winTunLUID   winipcfg.LUID
+	winTunDNS    []netip.Addr
 	winIPStack   *stack.Stack
 	winMu        sync.Mutex
 
@@ -337,6 +339,14 @@ func setupRoutingWindowsLUID(luid winipcfg.LUID) error {
 	if err := luid.SetIPAddressesForFamily(winipcfg.AddressFamily(windows.AF_INET), []netip.Prefix{prefix}); err != nil {
 		return fmt.Errorf("set ipv4 address on LUID %v: %w", luid, err)
 	}
+	previousDNS, err := luid.DNS()
+	if err != nil {
+		return fmt.Errorf("read DNS servers on LUID %v: %w", luid, err)
+	}
+	if err := luid.SetDNS(winipcfg.AddressFamily(windows.AF_INET), []netip.Addr{netip.MustParseAddr("198.18.0.1")}, nil); err != nil {
+		return fmt.Errorf("set TUN DNS on LUID %v: %w", luid, err)
+	}
+	winTunDNS = previousDNS
 
 	// Configure interface settings: enable IPv4 forwarding, disable router discovery.
 	if inetIf, err := luid.IPInterface(winipcfg.AddressFamily(windows.AF_INET)); err == nil {
@@ -393,11 +403,20 @@ func Cleanup() {
 
 func cleanupWindowsState() {
 	if winTunLUID != 0 {
+		if winTunDNS != nil {
+			_ = winTunLUID.SetDNS(winipcfg.AddressFamily(windows.AF_INET), winTunDNS, nil)
+			winTunDNS = nil
+		} else {
+			_ = winTunLUID.FlushDNS(winipcfg.AddressFamily(windows.AF_INET))
+		}
 		cleanupInstalledRoutes(winTunLUID, []netip.Prefix{
 			netip.MustParsePrefix("0.0.0.0/1"),
 			netip.MustParsePrefix("128.0.0.0/1"),
 		})
 		winTunLUID = 0
+	}
+	if winTunLUID == 0 {
+		restoreDiscoveredTUNDNS()
 	}
 	// Fallback deletion to ensure routes are removed even if called from a separate CLI process
 	// (e.g., 'vproxy clean' or 'vproxy stop') where winTunLUID is 0.
@@ -407,6 +426,28 @@ func cleanupWindowsState() {
 	if winTunDevice != nil {
 		winTunDevice.Close()
 		winTunDevice = nil
+	}
+}
+
+func restoreDiscoveredTUNDNS() {
+	adapters, err := winipcfg.GetAdaptersAddresses(windows.AF_UNSPEC, winipcfg.GAAFlagIncludeAll)
+	if err != nil {
+		return
+	}
+	for _, adapter := range adapters {
+		if adapter == nil {
+			continue
+		}
+		dnsServers, err := adapter.LUID.DNS()
+		if err != nil {
+			continue
+		}
+		for _, server := range dnsServers {
+			if server == netip.MustParseAddr("198.18.0.1") {
+				_ = adapter.LUID.FlushDNS(winipcfg.AddressFamily(windows.AF_INET))
+				return
+			}
+		}
 	}
 }
 
@@ -448,7 +489,7 @@ func GetDialerControl() func(network, address string, c syscall.RawConn) error {
 	return func(network, address string, c syscall.RawConn) error {
 		host, _, splitErr := net.SplitHostPort(address)
 		if splitErr == nil {
-			if ip, parseErr := netip.ParseAddr(host); parseErr == nil && ip.IsLoopback() {
+			if isLocalBypassAddress(host) {
 				return nil
 			}
 		}
@@ -466,6 +507,17 @@ func GetDialerControl() func(network, address string, c syscall.RawConn) error {
 		})
 		return opErr
 	}
+}
+
+func isLocalBypassAddress(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
 }
 
 // StartDarwinTransparent is not supported on Windows.

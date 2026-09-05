@@ -17,7 +17,6 @@ import (
 // DefaultDialerControl specifies the default dialer control function to use when bypassing transparent proxy redirection.
 var DefaultDialerControl func(network, address string, c syscall.RawConn) error
 
-
 // SOCKS request commands as defined in RFC 1928 section 4.
 const (
 	Version5        = 0x05 // SOCKS5 protocol version
@@ -254,15 +253,15 @@ func (d *ControlDialer) Dial(network, address string) (net.Conn, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	
+
 	dialCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	
+
 	conn, err := nd.DialContext(dialCtx, network, address)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Set an initial deadline for SOCKS5 handshake/negotiation.
 	// This will be cleared by the caller (DialTCP or DialUDP) once the handshake finishes.
 	conn.SetDeadline(time.Now().Add(timeout))
@@ -331,7 +330,7 @@ func (s *Socks5Proxy) DialUDP(ctx context.Context, targetAddr string, timeout ti
 		ctrlConn.Close()
 		return nil, err
 	}
-	
+
 	// 发送 UDP ASSOCIATE 请求 (地址设为 0.0.0.0:0)
 	req := []byte{Version5, CmdUDPAssociate, 0, AtypIPv4, 0, 0, 0, 0, 0, 0}
 	if _, err := ctrlConn.Write(req); err != nil {
@@ -398,7 +397,7 @@ func (c *socksUDPConn) Write(b []byte) (int, error) {
 	// 2. 拼接目标地址和原始数据
 	payload := append(header, c.target...)
 	payload = append(payload, b...)
-	
+
 	_, err := c.UDPConn.Write(payload)
 	if err != nil {
 		return 0, err
@@ -415,14 +414,14 @@ func (c *socksUDPConn) Read(b []byte) (int, error) {
 	if n < 4 {
 		return 0, io.ErrUnexpectedEOF
 	}
-	
+
 	// 简单的头部解析 (跳过 RSV, FRAG)
 	// 解析地址以确定数据起始偏移
 	addr := SplitAddr(buf[3:])
 	if addr == nil {
 		return 0, fmt.Errorf("invalid socks udp header")
 	}
-	
+
 	dataOffset := 3 + len(addr)
 	copy(b, buf[dataOffset:n])
 	return n - dataOffset, nil

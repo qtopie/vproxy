@@ -52,6 +52,17 @@
 - **And** non-success in any stage returns a non-zero exit code
 - **Mapped Test:** `tests/socks5/main.go` unit and command tests
 
+### Feature: Windows TUN DNS and local upstream routing
+
+#### Scenario 6: [SPEC-WIN-006] TUN DNS and local/private upstream bypass
+- **Given** Windows transparent TUN mode is active
+- **When** the Wintun interface is configured
+- **Then** IPv4 DNS for the interface is set to the local TUN DNS endpoint `198.18.0.1`
+- **And** vproxy outbound sockets skip physical-interface binding for loopback, private, and link-local destinations
+- **And** connections to a local SOCKS5 upstream remain reachable without being redirected through the TUN
+- **And** TUN startup fails transactionally if mandatory DNS configuration fails
+- **Mapped Test:** Windows routing/DNS integration harness and SOCKS5 end-to-end verification
+
 ### Feature: 原生 IP Helper API 与 LUID 驱动适配
 
 #### Scenario 5: [SPEC-WIN-005] 通过 LUID 与 IP Helper API 原生配置网络与路由
