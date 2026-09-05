@@ -25,6 +25,10 @@ var (
 	useTun     = flag.Bool("tun", false, "enable TUN mode (Linux only)")
 )
 
+func init() {
+	flag.StringVar(configPath, "config", "vproxy.json", "path to config file (alias for -c)")
+}
+
 func main() {
 	flag.Parse()
 	args := flag.Args()
