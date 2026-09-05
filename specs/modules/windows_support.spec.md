@@ -63,6 +63,16 @@
 - **And** TUN startup fails transactionally if mandatory DNS configuration fails
 - **Mapped Test:** Windows routing/DNS integration harness and SOCKS5 end-to-end verification
 
+#### Scenario 7: [SPEC-WIN-007] Windows TUN uses a peer DNS address and L3 endpoint
+- **Given** Windows Wintun exposes host address `198.18.0.1/15`
+- **When** transparent TUN mode configures DNS and the gVisor link endpoint
+- **Then** the Wintun DNS server is configured as peer address `198.18.0.2`, not the host address
+- **And** the gVisor stack accepts `198.18.0.2/15` for DNS interception
+- **And** the Wintun bridge uses an empty link address because Wintun is an L3 device
+- **And** the Wintun IPv4 interface metric remains explicitly preferred
+- **And** cleanup removes the peer address and restores the original DNS configuration
+- **Mapped Test:** Windows explicit DNS query and TUN HTTPS integration harness
+
 ### Feature: 原生 IP Helper API 与 LUID 驱动适配
 
 #### Scenario 5: [SPEC-WIN-005] 通过 LUID 与 IP Helper API 原生配置网络与路由

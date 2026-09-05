@@ -171,8 +171,7 @@ func StartWindowsTransparent(ctx context.Context, tcpHandler func(net.Conn), udp
 	})
 	winIPStack = s
 
-	linkMAC, _ := net.ParseMAC("aa:bb:cc:dd:ee:ff")
-	chanEP := channel.New(256, 1500, tcpip.LinkAddress(linkMAC))
+	chanEP := channel.New(256, 1500, "")
 	if tcpipErr := s.CreateNIC(1, chanEP); tcpipErr != nil {
 		return fmt.Errorf("CreateNIC: %v", tcpipErr)
 	}
@@ -192,6 +191,16 @@ func StartWindowsTransparent(ctx context.Context, tcpHandler func(net.Conn), udp
 		},
 	}, stack.AddressProperties{}); tcpipErr != nil {
 		log.Printf("[TUN/W] Warning: AddProtocolAddress: %v", tcpipErr)
+	}
+	peerDNS := [4]byte{198, 18, 0, 2}
+	if tcpipErr := s.AddProtocolAddress(1, tcpip.ProtocolAddress{
+		Protocol: ipv4.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddressWithPrefix{
+			Address:   tcpip.AddrFrom4(peerDNS),
+			PrefixLen: 15,
+		},
+	}, stack.AddressProperties{}); tcpipErr != nil {
+		return fmt.Errorf("add TUN peer DNS address: %v", tcpipErr)
 	}
 
 	s.SetRouteTable([]tcpip.Route{
@@ -343,7 +352,7 @@ func setupRoutingWindowsLUID(luid winipcfg.LUID) error {
 	if err != nil {
 		return fmt.Errorf("read DNS servers on LUID %v: %w", luid, err)
 	}
-	if err := luid.SetDNS(winipcfg.AddressFamily(windows.AF_INET), []netip.Addr{netip.MustParseAddr("198.18.0.1")}, nil); err != nil {
+	if err := luid.SetDNS(winipcfg.AddressFamily(windows.AF_INET), []netip.Addr{netip.MustParseAddr("198.18.0.2")}, nil); err != nil {
 		return fmt.Errorf("set TUN DNS on LUID %v: %w", luid, err)
 	}
 	winTunDNS = previousDNS
@@ -443,7 +452,7 @@ func restoreDiscoveredTUNDNS() {
 			continue
 		}
 		for _, server := range dnsServers {
-			if server == netip.MustParseAddr("198.18.0.1") {
+			if server == netip.MustParseAddr("198.18.0.1") || server == netip.MustParseAddr("198.18.0.2") {
 				_ = adapter.LUID.FlushDNS(winipcfg.AddressFamily(windows.AF_INET))
 				return
 			}
