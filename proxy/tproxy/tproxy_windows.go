@@ -446,6 +446,12 @@ func GetDialerControl() func(network, address string, c syscall.RawConn) error {
 		return nil
 	}
 	return func(network, address string, c syscall.RawConn) error {
+		host, _, splitErr := net.SplitHostPort(address)
+		if splitErr == nil {
+			if ip, parseErr := netip.ParseAddr(host); parseErr == nil && ip.IsLoopback() {
+				return nil
+			}
+		}
 		var opErr error
 		_ = c.Control(func(fd uintptr) {
 			switch network {

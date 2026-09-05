@@ -245,6 +245,11 @@ func (d *ControlDialer) Dial(network, address string) (net.Conn, error) {
 		Timeout: timeout,
 		Control: control,
 	}
+	if host, _, err := net.SplitHostPort(address); err == nil {
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			nd.Control = nil
+		}
+	}
 	ctx := d.Context
 	if ctx == nil {
 		ctx = context.Background()

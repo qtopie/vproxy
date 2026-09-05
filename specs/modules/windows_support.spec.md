@@ -42,6 +42,16 @@
 - **Then** the daemon is ready to accept intercepted traffic and the caller may run the required timed DNS, TCP/443, and HTTPS checks followed by mandatory `vproxy clean`
 - **Mapped Test:** Windows integration harness
 
+### Feature: SOCKS5 proxy connectivity test utility
+
+#### Scenario 5: [SPEC-SOCKS5-001] 独立验证 SOCKS5 代理链路
+- **Given** a SOCKS5 endpoint in `socks5://host:port` format
+- **When** the test utility is executed with an optional target URL and timeout
+- **Then** it reports TCP reachability to the SOCKS5 endpoint, SOCKS5 CONNECT success, target HTTP status, elapsed time, and a bounded response snippet
+- **And** it performs no TUN, route, adapter, or firewall changes
+- **And** non-success in any stage returns a non-zero exit code
+- **Mapped Test:** `tests/socks5/main.go` unit and command tests
+
 ### Feature: 原生 IP Helper API 与 LUID 驱动适配
 
 #### Scenario 5: [SPEC-WIN-005] 通过 LUID 与 IP Helper API 原生配置网络与路由
