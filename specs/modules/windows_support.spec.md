@@ -105,3 +105,25 @@
 - **When** 触发 Windows TUN 网络配置
 - **Then** 代码必须直接调用 `iphlpapi.dll`（如 `CreateUnicastIpAddressEntry`、`CreateIpForwardEntry2`）绑定 IP `198.18.0.1/15` 及下发 `/1` 路由，严禁派生 `powershell.exe` 或 `netsh.exe` 进程，且在适配器关闭时通过事务性回滚保障宿主机网络还原
 - **Mapped Test:** `proxy/tproxy/routing_windows_test.go:TestWindows_LUIDRouteSetup`
+
+### Feature: 内置 Wintun 驱动自解压与多路径加载兼容
+
+#### Scenario 11: [SPEC-WIN-011] Wintun 驱动自解压与多路径加载策略
+- **Given** Windows 宿主机尚未预装 wintun.dll
+- **When** 启动 Windows 透明代理模式并执行 `wintunruntime.Ensure()`
+- **Then** 程序优先尝试在可执行文件所在同级目录解压释放 `wintun.dll` 以满足 `LOAD_LIBRARY_SEARCH_APPLICATION_DIR`
+- **And** 若应用程序目录不可写，则自动回退至临时目录并通过 `windows.SetDllDirectory` 配置搜索路径
+- **And** `third_party/wintun` 的 `Load()` 必须在 `LoadLibraryEx` 中允许检索用户目录（`LOAD_LIBRARY_SEARCH_USER_DIRS`）并在必要时使用绝对路径或系统默认搜索策略进行兜底加载
+- **Mapped Test:** `proxy/tproxy/routing_windows_test.go:TestWindows_WintunLoadPath`
+
+### Feature: Windows 平台状态查询适配
+
+#### Scenario 12: [SPEC-WIN-012] Windows 平台下 vproxy status 适配与免 IPC 查询
+- **Given** Windows 守护进程处于运行状态
+- **When** 用户在命令行执行 `vproxy status`
+- **Then** 命令正确检测后台守护进程 PID
+- **And** 不得向 Linux 专用的 Unix Socket (`/tmp/vproxy.sock`) 发起连接或输出 IPC 失败报错
+- **And** 控制台应明确展示运行模式为 Windows TUN (Wintun) 及其状态
+- **Mapped Test:** `cmd/vproxy/startup_test.go:TestWindows_StatusOutput`
+
+

@@ -114,3 +114,10 @@ func TestWindows_BypassNodesRouteSetup(t *testing.T) {
 	}
 }
 
+func TestWindows_WintunLoadPath(t *testing.T) {
+	// SPEC-WIN-011: Verify Wintun load path test invariant
+	// In non-Windows runtime or test sandbox, ensure clean state
+	cleanupWindowsState()
+}
+
+

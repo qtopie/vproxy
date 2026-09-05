@@ -60,8 +60,10 @@ func main() {
 			if _, err := os.FindProcess(pid); err == nil {
 				fmt.Printf("  Background Daemon: Running (PID: %d)\n", pid)
 
-				// 2. Try to get detailed status via IPC
-				if resp, err := vlink.RequestStatus(); err == nil {
+				// 2. Try to get detailed status via IPC (Linux only; Windows uses Wintun TUN mode without Unix socket IPC)
+				if runtime.GOOS == "windows" {
+					fmt.Printf("  Mode:              Windows TUN (Wintun)\n")
+				} else if resp, err := vlink.RequestStatus(); err == nil {
 					fmt.Printf("  Version:           %s\n", resp.Version)
 					fmt.Printf("  Uptime:            %s\n", resp.Uptime)
 				} else {

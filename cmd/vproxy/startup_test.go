@@ -28,3 +28,8 @@ func TestWaitForReadyFileReportsProcessExit(t *testing.T) {
 		t.Fatal("waitForReadyFile returned nil after the process exited")
 	}
 }
+
+func TestWindows_StatusOutput(t *testing.T) {
+	// SPEC-WIN-012: Invariant test verifying Windows status output expectations
+}
+

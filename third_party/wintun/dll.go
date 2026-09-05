@@ -81,9 +81,15 @@ func (d *lazyDLL) Load() error {
 
 	const (
 		LOAD_LIBRARY_SEARCH_APPLICATION_DIR = 0x00000200
+		LOAD_LIBRARY_SEARCH_USER_DIRS        = 0x00000400
 		LOAD_LIBRARY_SEARCH_SYSTEM32        = 0x00000800
 	)
-	module, err := windows.LoadLibraryEx(d.Name, 0, LOAD_LIBRARY_SEARCH_APPLICATION_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32)
+	flags := uintptr(LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_USER_DIRS | LOAD_LIBRARY_SEARCH_SYSTEM32)
+	module, err := windows.LoadLibraryEx(d.Name, 0, flags)
+	if err != nil {
+		// Fallback 1: Try standard LoadLibrary which respects SetDllDirectory and current process path
+		module, err = windows.LoadLibrary(d.Name)
+	}
 	if err != nil {
 		return fmt.Errorf("Unable to load library: %w", err)
 	}
@@ -93,6 +99,7 @@ func (d *lazyDLL) Load() error {
 		d.onLoad(d)
 	}
 	return nil
+
 }
 
 func (p *lazyProc) nameToAddr() (uintptr, error) {
