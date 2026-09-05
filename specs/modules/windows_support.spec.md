@@ -73,6 +73,14 @@
 - **And** cleanup removes the peer address and restores the original DNS configuration
 - **Mapped Test:** Windows explicit DNS query and TUN HTTPS integration harness
 
+#### Scenario 8: [SPEC-WIN-008] Windows TUN preserves inbound TCP payloads
+- **Given** a TCP connection is accepted by the Windows gVisor TUN stack
+- **When** Wintun delivers packets with hardware checksum offload metadata or incomplete software checksums
+- **Then** the bridge marks the inbound packet checksum as validated before injecting it into gVisor
+- **And** the channel endpoint advertises receive checksum offload capability
+- **And** a native `curl.exe` HTTPS request can exchange request and response payloads after the upstream tunnel is established
+- **Mapped Test:** Windows TUN relay integration harness using `curl.exe -v`
+
 ### Feature: 原生 IP Helper API 与 LUID 驱动适配
 
 #### Scenario 5: [SPEC-WIN-005] 通过 LUID 与 IP Helper API 原生配置网络与路由

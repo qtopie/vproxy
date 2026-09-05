@@ -172,6 +172,7 @@ func StartWindowsTransparent(ctx context.Context, tcpHandler func(net.Conn), udp
 	winIPStack = s
 
 	chanEP := channel.New(256, 1500, "")
+	chanEP.LinkEPCapabilities = stack.CapabilityRXChecksumOffload
 	if tcpipErr := s.CreateNIC(1, chanEP); tcpipErr != nil {
 		return fmt.Errorf("CreateNIC: %v", tcpipErr)
 	}
@@ -308,11 +309,13 @@ func bridgeTunWindows(dev tun.Device, ep *channel.Endpoint) {
 				pb := stack.NewPacketBuffer(stack.PacketBufferOptions{
 					Payload: buffer.MakeWithData(pktBuf),
 				})
+				pb.RXChecksumValidated = true
 				proto := tcpip.NetworkProtocolNumber(ipv4.ProtocolNumber)
 				if (pktBuf[0] >> 4) == 6 {
 					proto = ipv6.ProtocolNumber
 				}
 				ep.InjectInbound(proto, pb)
+				pb.DecRef()
 			}
 		}
 	}()
@@ -327,7 +330,11 @@ func bridgeTunWindows(dev tun.Device, ep *channel.Endpoint) {
 		raw := view.AsSlice()
 		out := make([]byte, len(raw))
 		copy(out, raw)
-		dev.Write([][]byte{out}, offset)
+		if written, err := dev.Write([][]byte{out}, offset); err != nil {
+			log.Printf("[TUN/W] Failed to write %d-byte packet to Wintun: %v", len(out), err)
+		} else if written != 1 {
+			log.Printf("[TUN/W] Wintun accepted %d/%d outbound packets", written, 1)
+		}
 		view.Release()
 	}
 }

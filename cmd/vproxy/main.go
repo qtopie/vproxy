@@ -190,13 +190,14 @@ func startBackgroundServer(config, pidFile string) error {
 	}
 
 	binary, _ := os.Executable()
-	bgArgs := []string{"-c", config, "start"}
+	bgArgs := []string{"-c", config}
 	if *useTun {
 		bgArgs = append(bgArgs, "-tun")
 	}
 	if *verbose {
 		bgArgs = append(bgArgs, "-v")
 	}
+	bgArgs = append(bgArgs, "start")
 	readyFile := filepath.Join(os.TempDir(), fmt.Sprintf("vproxy-ready-%d", time.Now().UnixNano()))
 	_ = os.Remove(readyFile)
 	cmd := exec.Command(binary, bgArgs...)
