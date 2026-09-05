@@ -21,7 +21,7 @@ func Relay(ctx context.Context, left, right net.Conn) error {
 		var n int64
 		n, errLeft = io.Copy(right, left)
 		TraceDebugf(ctx, ">>> L -> R: copied %d bytes, err: %v", n, errLeft)
-		_ = right.Close() // Notify the other side we are done writing
+		closeWrite(right)
 	}()
 
 	go func() {
@@ -29,7 +29,7 @@ func Relay(ctx context.Context, left, right net.Conn) error {
 		var n int64
 		n, errRight = io.Copy(left, right)
 		TraceDebugf(ctx, "<<< R -> L: copied %d bytes, err: %v", n, errRight)
-		_ = left.Close() // Notify the other side we are done writing
+		closeWrite(left)
 	}()
 
 	wg.Wait()
@@ -41,6 +41,14 @@ func Relay(ctx context.Context, left, right net.Conn) error {
 		return errRight
 	}
 	return nil
+}
+
+func closeWrite(conn net.Conn) {
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.CloseWrite()
+		return
+	}
+	_ = conn.Close()
 }
 
 // isIgnorableError checks if an error is an expected close signal (EOF or timeout).

@@ -81,6 +81,14 @@
 - **And** a native `curl.exe` HTTPS request can exchange request and response payloads after the upstream tunnel is established
 - **Mapped Test:** Windows TUN relay integration harness using `curl.exe -v`
 
+#### Scenario 9: [SPEC-WIN-009] Windows TUN avoids upstream routing loops
+- **Given** transparent TUN mode installs the two `/1` interception routes
+- **When** vproxy uses an upstream endpoint whose host is not loopback, private, or link-local
+- **Then** startup resolves the upstream endpoint address and installs a more-specific host route through the pre-existing physical interface
+- **And** cleanup removes only the host routes created by vproxy
+- **And** vproxy logs a clear diagnostic when a loopback upstream delegates internet dialing to another process whose sockets cannot inherit vproxy's physical-interface binding
+- **Mapped Test:** Windows routing harness with a resolved remote upstream and local SOCKS5 loop-deadlock diagnostic
+
 ### Feature: 原生 IP Helper API 与 LUID 驱动适配
 
 #### Scenario 5: [SPEC-WIN-005] 通过 LUID 与 IP Helper API 原生配置网络与路由

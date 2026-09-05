@@ -257,7 +257,12 @@ func (ph *ProxyHandler) StartTransparent() error {
 
 	if runtime.GOOS == "windows" {
 		SetDialerControl(tproxy.GetDialerControl())
-		return tproxy.StartWindowsTransparent(context.Background(), func(conn net.Conn) {
+		for _, upstream := range ph.sm.GetServers() {
+			if u, err := url.Parse(upstream); err == nil && isLoopbackUpstream(u.Hostname()) {
+				Warnf("[TUN/W] Loopback upstream %s delegates remote dialing to another process; its outbound sockets may be captured by the /1 TUN routes", upstream)
+			}
+		}
+		return tproxy.StartWindowsTransparent(context.Background(), ph.sm.GetServers(), func(conn net.Conn) {
 			defer conn.Close()
 			target, err := tproxy.GetOriginalDst(conn)
 			if err != nil {
@@ -309,6 +314,11 @@ func (ph *ProxyHandler) StartTransparent() error {
 	}
 
 	return nil
+}
+
+func isLoopbackUpstream(host string) bool {
+	ip := net.ParseIP(host)
+	return host == "localhost" || (ip != nil && ip.IsLoopback())
 }
 
 func (ph *ProxyHandler) handleUDP(ctx context.Context, local net.Conn, target string) {
