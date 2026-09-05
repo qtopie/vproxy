@@ -241,6 +241,37 @@ func (ph *ProxyHandler) isLocalRelay(process string, pid int) bool {
 	return false
 }
 
+func (ph *ProxyHandler) isForwardedRelay(conn net.Conn, isFakeIP bool, pid int) bool {
+	if isFakeIP || pid > 0 || !ph.hasLocalUpstream() {
+		return false
+	}
+	type remoteAddrIface interface {
+		RemoteAddr() net.Addr
+	}
+	c, ok := conn.(remoteAddrIface)
+	if !ok || c.RemoteAddr() == nil {
+		return false
+	}
+	var srcIP net.IP
+	switch a := c.RemoteAddr().(type) {
+	case *net.TCPAddr:
+		srcIP = a.IP
+	case *net.UDPAddr:
+		srcIP = a.IP
+	}
+	if srcIP == nil {
+		return false
+	}
+	// Native Windows applications sending packets into Wintun have source IP 198.18.0.1.
+	// Packets forwarded from WSL2 (Hyper-V virtual switch) or virtual machines have their guest/virtual IP (e.g. 172.x.x.x).
+	// If the source IP is not 198.18.0.1 and is private, or if pid == 0 (no host socket entry), this connection
+	// represents forwarded traffic from an external virtual subsystem that must be routed directly via physical NIC.
+	if !srcIP.Equal(net.ParseIP("198.18.0.1")) && srcIP.IsPrivate() {
+		return true
+	}
+	return pid == 0
+}
+
 func (ph *ProxyHandler) needsProcessMetadata() bool {
 	return (ph.rm != nil && ph.rm.HasProcessMetadataRules()) || ph.hasLocalUpstream()
 }
@@ -371,6 +402,7 @@ func isLoopbackUpstream(host string) bool {
 
 func (ph *ProxyHandler) handleUDP(ctx context.Context, local net.Conn, target string) {
 	// Restore domain from Fake-IP if necessary
+	isFakeIP := false
 	if dns.GlobalPool != nil {
 		host, port, err := net.SplitHostPort(target)
 		if err == nil {
@@ -379,6 +411,7 @@ func (ph *ProxyHandler) handleUDP(ctx context.Context, local net.Conn, target st
 				domain := dns.GlobalPool.GetDomain(ip)
 				if domain != "" {
 					target = net.JoinHostPort(domain, port)
+					isFakeIP = true
 					log.Printf("[TUN] Restored UDP Fake-IP %s -> %s", host, domain)
 				}
 			}
@@ -391,6 +424,29 @@ func (ph *ProxyHandler) handleUDP(ctx context.Context, local net.Conn, target st
 	if (runtime.GOOS == "darwin" || runtime.GOOS == "windows") && ph.needsProcessMetadata() {
 		process, pid, _ = tproxy.GetProcessNameByConn(local)
 	}
+
+	if runtime.GOOS == "windows" && ph.isForwardedRelay(local, isFakeIP, pid) {
+		Debugf("[UDP] Detected forwarded UDP connection from virtual subsystem %s targeting %s (no host PID); routing DIRECT to prevent loop", local.RemoteAddr(), target)
+		d := net.Dialer{
+			Timeout: 5 * time.Second,
+			Control: GetDialerControl(),
+		}
+		directConn, err := d.Dial("udp", target)
+		if err != nil {
+			Errorf("[UDP] Failed to dial direct for %s: %v", target, err)
+			return
+		}
+		defer directConn.Close()
+		done := make(chan struct{})
+		go func() {
+			io.Copy(directConn, local)
+			close(done)
+		}()
+		io.Copy(local, directConn)
+		<-done
+		return
+	}
+
 	upstream, err := ph.dialTargetUDP(target, process, pid)
 	if err != nil {
 		Errorf("[UDP] Failed to dial upstream for %s: %v", target, err)
@@ -994,6 +1050,7 @@ func (ph *ProxyHandler) dialTargetUDP(target string, process string, pid int) (n
 
 func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 	// Restore domain from Fake-IP if necessary
+	isFakeIP := false
 	if dns.GlobalPool != nil {
 		host, port, err := net.SplitHostPort(target)
 		if err == nil {
@@ -1002,6 +1059,7 @@ func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 				domain := dns.GlobalPool.GetDomain(ip)
 				if domain != "" {
 					target = net.JoinHostPort(domain, port)
+					isFakeIP = true
 					log.Printf("[TUN] Restored Fake-IP %s -> %s", host, domain)
 				}
 			}
@@ -1039,6 +1097,19 @@ func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 	// For TUN/GVisor, target == LocalAddr is expected behavior, so we only check this for REDIRECT/eBPF modes.
 	if target == conn.LocalAddr().String() && !tproxy.IsTUNConn(conn) {
 		TraceErrorf(ctx, "Loop detected: target is the same as local address %s, dropping connection", target)
+		return
+	}
+
+	if runtime.GOOS == "windows" && ph.isForwardedRelay(conn, isFakeIP, pid) {
+		TraceInfof(ctx, "[TUN/W] Detected non-FakeIP outbound connection without host PID from %s targeting %s; routing DIRECT via physical interface to prevent loop", conn.RemoteAddr(), target)
+		rc, err := ph.dialDirect(target)
+		if err != nil {
+			TraceErrorf(ctx, "Failed to connect directly to %s: %v", target, err)
+			return
+		}
+		defer rc.Close()
+		TraceInfof(ctx, "Successfully established direct bypass tunnel to target %s", target)
+		_ = Relay(ctx, rc, conn)
 		return
 	}
 

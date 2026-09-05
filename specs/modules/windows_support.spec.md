@@ -95,6 +95,7 @@
 - **Then** vproxy supports a `bypass_nodes` configuration list containing remote node IPs, CIDRs, or hostnames
 - **And** Windows TUN startup installs `/32` physical interface bypass routes for all entries in `bypass_nodes` and cleans them up upon exit
 - **And** intercepted connections whose originating process/PID matches the local upstream listener (or a `PROCESS,<name>,DIRECT` rule) are dialed directly via `ph.dialDirect` through the physical interface
+- **And** forwarded non-FakeIP connections without a Windows host PID (such as from WSL2/Hyper-V virtual interfaces) are dialed directly via `ph.dialDirect` through the physical interface to prevent loop deadlocks
 - **Mapped Test:** Windows node bypass routing harness and local relay loop prevention test
 
 ### Feature: 原生 IP Helper API 与 LUID 驱动适配

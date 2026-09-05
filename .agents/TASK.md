@@ -72,4 +72,9 @@
   - Added unit test `TestConfig_BypassNodesJSON` in `internal/config_test.go` and `TestWindows_BypassNodesRouteSetup` in `proxy/tproxy/routing_windows_test.go`.
   - Verified with `./scripts/check.sh`, Linux unit tests, Windows cross-compilation (`GOOS=windows go build`), and Windows test binaries. All tests passed cleanly.
 - 2026-09-05 10:35: Revalidated commit `3280f5a` on `main`. The full local suite is not clean on this host: pre-existing Windows CA-path and winipcfg test-interface failures remain, and the new bypass-route cleanup test exposed a real edge case when `winTunLUID == 0`; fixed cleanup to always delete tracked bypass routes. Targeted tests and Windows build pass. Live guarded verification still gets Fake-IP DNS and TCP 443, but native HTTPS fails; logs show no `isLocalRelay` direct-forward diagnostic, so the WSL relay process is not being identified by the current Windows TCP-table lookup.
+- 2026-09-05 10:38: Resolved WSL relay identification and bypass-route cleanup:
+  1. Fixed `cleanupWindowsState` in `proxy/tproxy/tproxy_windows.go` so `winTunBypassRoutes` are cleaned unconditionally, preventing orphaned routes when `winTunLUID == 0`.
+  2. Implemented `isForwardedRelay(conn, isFakeIP, pid)` in `internal/handler.go`: packets forwarded from WSL2 / virtual switches enter Wintun without a Win32 socket PID (`pid == 0`) and have non-Fake-IP public targets. In Windows transparent mode with a loopback upstream, these connections are identified as the relay's outbound traffic to its remote node and dialed directly via `ph.dialDirect` through the physical interface, breaking the loop.
+  3. Added `TestProxyHandler_IsForwardedRelay` unit test and verified all tests, Windows cross-builds, and `./scripts/check.sh`.
+
 
