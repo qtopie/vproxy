@@ -8,6 +8,7 @@
 - **`tproxy.GetProcessNameByConn(conn interface{}) (string, int, error)`**: 支持从 TCP/UDP 连接中提取远程地址（应用端源端口），并在 Windows 系统内核表中反查对应的 PID 及可执行文件完整路径。
 - **Windows TUN startup health**: `vproxy init` must not report success until the background server has completed Wintun/TUN initialization and routing setup; initialization errors must be surfaced and must not leave interception routes installed.
 - **Windows TUN routing safety**: Wintun creation, gVisor stack setup, and both `/1` route additions are transactional. Any failure must remove routes, close the TUN device, and leave the host on its original route configuration.
+- **Windows Native IP Helper & LUID Contract**: Adapter IP address assignment (`198.18.0.1/15`) and split-routing injection (`0.0.0.0/1`, `128.0.0.0/1`) MUST operate directly against the Wintun adapter's 64-bit `NET_LUID` via Windows IP Helper APIs (`iphlpapi.dll`), without executing external shells/binaries (`netsh.exe`, `powershell.exe`) or blocking on PnP adapter name discovery via `net.Interfaces()`.
 
 ## 3. Acceptance Criteria (BDD)
 
@@ -40,3 +41,11 @@
 - **When** `vproxy init` returns success
 - **Then** the daemon is ready to accept intercepted traffic and the caller may run the required timed DNS, TCP/443, and HTTPS checks followed by mandatory `vproxy clean`
 - **Mapped Test:** Windows integration harness
+
+### Feature: 原生 IP Helper API 与 LUID 驱动适配
+
+#### Scenario 5: [SPEC-WIN-005] 通过 LUID 与 IP Helper API 原生配置网络与路由
+- **Given** Wintun 适配器创建成功并获得 64 位 `NET_LUID`
+- **When** 触发 Windows TUN 网络配置
+- **Then** 代码必须直接调用 `iphlpapi.dll`（如 `CreateUnicastIpAddressEntry`、`CreateIpForwardEntry2`）绑定 IP `198.18.0.1/15` 及下发 `/1` 路由，严禁派生 `powershell.exe` 或 `netsh.exe` 进程，且在适配器关闭时通过事务性回滚保障宿主机网络还原
+- **Mapped Test:** `proxy/tproxy/routing_windows_test.go:TestWindows_LUIDRouteSetup`

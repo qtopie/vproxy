@@ -4,8 +4,21 @@
 - [x] Record the current task and required validation steps.
 - [x] For TUN usage, run the timed connectivity checks after `vproxy init`.
 - [x] Always run `vproxy clean` after TUN verification.
+- [x] Phase 1: Draft and obtain approval for SPEC-WIN-005 (LUID & IP Helper API refactor).
+- [x] Phase 2: Add harness/test stubs for Windows LUID and native IP Helper API operations.
+- [x] Phase 3: Implement internal `winipcfg` package with native `iphlpapi.dll` syscalls.
+- [x] Phase 4: Refactor `proxy/tproxy/tproxy_windows.go` to use LUID, native address assignment, and transactional `/1` routes.
+- [x] Phase 5: Run tests, cross-compile, and execute verification suite.
 
 ## Current Context
+- Successfully refactored Windows TUN network and routing architecture following sing-box/sing-tun model:
+  1. Spec-First: SPEC-WIN-005 drafted and approved in specs/modules/windows_support.spec.md.
+  2. Integrated internal/winipcfg module providing zero-dependency Go bindings for Windows IP Helper API (iphlpapi.dll).
+  3. Replaced netsh.exe and powershell.exe adapter name polling with direct NET_LUID configuration.
+  4. Configured IP 198.18.0.1/15, MTU 1500, forwarding, and two transactional /1 routes via MibIPforwardRow2 directly bound to LUID.
+  5. Implemented deterministic adapter GUID generation via MD5 hashing.
+  6. Added unit and regression tests in proxy/tproxy/routing_windows_test.go.
+  7. Verified Linux and Windows cross-compilation (GOOS=windows go build/test) and passed full ./scripts/check.sh validation suite without spec drift.
 - Created as the persistent task context for the TUN init -> test -> clean workflow.
 - 2026-09-04: Administrator privileges were available and `C:\Windows\System32\wintun.dll` was present.
 - `vproxy init` reported that vproxy was already running, so it did not restart the existing process.
@@ -28,3 +41,4 @@
 - 2026-09-04 diagnostic result: `setupapi.dev.log` repeatedly reports `Failed to open driver package object ...wintun.inf... Error = 0x00000005` during `Wintun.Install`. PnP reports no Wintun/vproxy Net device, while Driver Store contains only `wintun.inf` 0.13.0.0 (`oem8.inf`) and the `wintun` service is running. This identifies a driver-package access/registration failure, not an adapter enumeration race.
 - 2026-09-04 23:16: Removed stale `oem8.inf` successfully with `pnputil /delete-driver oem8.inf /uninstall /force`. The official Wintun distribution is DLL-only, so no separate `wintun.inf`/`wintun.sys` package was available for manual `pnputil` installation. Retried bundled Wintun 0.14.1: `CreateTUN` again reported `Created TUN device: vproxy-tun`, but no adapter appeared in `Get-NetAdapter -IncludeHidden` or `Get-PnpDevice`; guarded init failed readiness and mandatory clean succeeded. The driver package is recreated by Wintun's install path and remains blocked during class configuration.
 - 2026-09-04 23:19: Network class ACL is owned by `BUILTIN\Administrators`; `Administrators` and `SYSTEM` have FullControl, and no `UpperFilters`/`LowerFilters` were found on existing network class entries. Code Integrity logs show no Wintun-specific block, although Windows virtualization/code-integrity policies are active. SetupAPI confirms the Wintun package stages, validates its WHQL catalog, and publishes successfully as `oem8.inf`; failure occurs afterward when configuring `ROOT\NET\0002`, where opening the driver package object returns `0x00000005` and the device remains `CM_PROB_NEED_CLASS_CONFIG (0x38)`. This points to Windows network class/driver-database state rather than repository ACLs or a missing DLL.
+- 2026-09-04 23:31: Cloned sing-box (`../sing-box`) and sing-tun (`../sing-tun`) to inspect Windows TUN implementation. Analyzed key differences: sing-tun uses `memmod` to load embedded `wintun.dll` without logger callback; computes requested GUID via MD5 hash; retrieves `NET_LUID` directly from the Wintun adapter (`Adapter.LUID()`); and configures IP/routes via Windows IP Helper API (`iphlpapi.dll` / `winipcfg`) directly on the LUID, entirely bypassing standard library interface enumeration (`net.Interfaces()`) and external commands (`netsh`/PowerShell).
