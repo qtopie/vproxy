@@ -89,6 +89,14 @@
 - **And** vproxy logs a clear diagnostic when a loopback upstream delegates internet dialing to another process whose sockets cannot inherit vproxy's physical-interface binding
 - **Mapped Test:** Windows routing harness with a resolved remote upstream and local SOCKS5 loop-deadlock diagnostic
 
+#### Scenario 10: [SPEC-WIN-010] Configurable node bypass routes and process-level direct relay
+- **Given** transparent TUN mode intercepts system-wide traffic via `/1` routes
+- **When** the upstream proxy is a local loopback relay (`socks5://127.0.0.1:1080`) whose actual remote nodes cannot be inferred automatically
+- **Then** vproxy supports a `bypass_nodes` configuration list containing remote node IPs, CIDRs, or hostnames
+- **And** Windows TUN startup installs `/32` physical interface bypass routes for all entries in `bypass_nodes` and cleans them up upon exit
+- **And** intercepted connections whose originating process/PID matches the local upstream listener (or a `PROCESS,<name>,DIRECT` rule) are dialed directly via `ph.dialDirect` through the physical interface
+- **Mapped Test:** Windows node bypass routing harness and local relay loop prevention test
+
 ### Feature: 原生 IP Helper API 与 LUID 驱动适配
 
 #### Scenario 5: [SPEC-WIN-005] 通过 LUID 与 IP Helper API 原生配置网络与路由

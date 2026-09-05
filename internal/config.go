@@ -17,6 +17,7 @@ type Config struct {
 	DirectDNS      *bool    `json:"direct_dns,omitempty"`
 	DialTimeoutMs  *int     `json:"dial_timeout_ms,omitempty"`
 	DialRetryCount *int     `json:"dial_retry_count,omitempty"`
+	BypassNodes    []string `json:"bypass_nodes,omitempty"`
 }
 
 // LoadConfig loads the configuration from the given path, with fallbacks to global and local defaults.

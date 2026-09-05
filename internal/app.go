@@ -634,6 +634,9 @@ func (a *App) setupServices() (*ServerManager, *ProxyHandler) {
 		rm.SetDirectDNS(*a.Config.DirectDNS)
 	}
 	ph := NewProxyHandler(sm, rm, a.LocalSocks, a.LocalHTTP, a.LocalTrans, a.Config.WebPort)
+	if len(a.Config.BypassNodes) > 0 {
+		ph.SetBypassNodes(a.Config.BypassNodes)
+	}
 	if a.Config.DialTimeoutMs != nil {
 		ph.DialTimeout = time.Duration(*a.Config.DialTimeoutMs) * time.Millisecond
 	}
@@ -665,6 +668,7 @@ func (a *App) watchConfig(path string, ph *ProxyHandler) {
 					directDNS = *cfg.DirectDNS
 				}
 				ph.UpdateRules(cfg.Rules, directDNS)
+				ph.SetBypassNodes(cfg.BypassNodes)
 				Debugf("Config reloaded")
 			}
 		}

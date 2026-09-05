@@ -57,3 +57,60 @@ func TestWindows_LUIDRouteSetup(t *testing.T) {
 	// Verify Cleanup is safe and doesn't panic
 	Cleanup()
 }
+
+func TestWindows_BypassNodesRouteSetup(t *testing.T) {
+	// SPEC-WIN-010: Verify data structure setup for bypass nodes and host /32 routes
+	bypassCIDR := "192.0.2.0/24"
+	bypassHost := "203.0.113.50"
+
+	prefixCIDR, err := netip.ParsePrefix(bypassCIDR)
+	if err != nil {
+		t.Fatalf("ParsePrefix failed for %s: %v", bypassCIDR, err)
+	}
+
+	addrHost, err := netip.ParseAddr(bypassHost)
+	if err != nil {
+		t.Fatalf("ParseAddr failed for %s: %v", bypassHost, err)
+	}
+	prefixHost := netip.PrefixFrom(addrHost, 32)
+
+	mockPhysLUID := winipcfg.LUID(87654321)
+	nextHop := netip.MustParseAddr("192.168.1.1")
+
+	row := winipcfg.MibIPforwardRow2{}
+	row.Init()
+	row.InterfaceLUID = mockPhysLUID
+	row.Metric = 1
+
+	if err := row.DestinationPrefix.SetPrefix(prefixCIDR); err != nil {
+		t.Fatalf("SetPrefix failed for %v: %v", prefixCIDR, err)
+	}
+	if err := row.NextHop.SetAddr(nextHop); err != nil {
+		t.Fatalf("SetAddr failed for %v: %v", nextHop, err)
+	}
+
+	rowHost := winipcfg.MibIPforwardRow2{}
+	rowHost.Init()
+	rowHost.InterfaceLUID = mockPhysLUID
+	rowHost.Metric = 1
+	if err := rowHost.DestinationPrefix.SetPrefix(prefixHost); err != nil {
+		t.Fatalf("SetPrefix failed for %v: %v", prefixHost, err)
+	}
+
+	winTunBypassRoutes = append(winTunBypassRoutes, winBypassRoute{
+		luid: mockPhysLUID, prefix: prefixCIDR, nextHop: nextHop,
+	}, winBypassRoute{
+		luid: mockPhysLUID, prefix: prefixHost, nextHop: nextHop,
+	})
+
+	if len(winTunBypassRoutes) != 2 {
+		t.Fatalf("expected 2 bypass routes, got %d", len(winTunBypassRoutes))
+	}
+
+	// Verify cleanup empties bypass route tracker
+	cleanupWindowsState()
+	if len(winTunBypassRoutes) != 0 {
+		t.Fatalf("expected bypass routes to be empty after cleanup, got %d", len(winTunBypassRoutes))
+	}
+}
+

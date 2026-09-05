@@ -158,11 +158,17 @@ type ProxyHandler struct {
 	transUDPLn     *net.UDPConn
 	udpSessions    sync.Map
 	ebpfResult     *ebpf.LoadResult
+	BypassNodes    []string
 }
 
 // SetEbpfResult sets the eBPF load result containing maps for orig dst lookup.
 func (ph *ProxyHandler) SetEbpfResult(r *ebpf.LoadResult) {
 	ph.ebpfResult = r
+}
+
+// SetBypassNodes updates the list of node addresses or prefixes to bypass from TUN routing.
+func (ph *ProxyHandler) SetBypassNodes(nodes []string) {
+	ph.BypassNodes = nodes
 }
 
 // NewProxyHandler constructs a ProxyHandler. Exported to allow callers in other packages
@@ -193,8 +199,50 @@ func (ph *ProxyHandler) UpdateRules(rules []string, directDNS bool) {
 	ph.rm.SetDirectDNS(directDNS)
 }
 
+func (ph *ProxyHandler) hasLocalUpstream() bool {
+	if ph.sm == nil {
+		return false
+	}
+	for _, server := range ph.sm.GetServers() {
+		if u, err := url.Parse(server); err == nil && isLoopbackUpstream(u.Hostname()) {
+			return true
+		}
+	}
+	return false
+}
+
+func (ph *ProxyHandler) isLocalRelay(process string, pid int) bool {
+	if pid <= 0 || ph.sm == nil {
+		return false
+	}
+	for _, server := range ph.sm.GetServers() {
+		u, err := url.Parse(server)
+		if err != nil || !isLoopbackUpstream(u.Hostname()) {
+			continue
+		}
+		portStr := u.Port()
+		if portStr == "" {
+			continue
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			continue
+		}
+		relayPath, relayPID, err := tproxy.GetProcessNameByPort(port)
+		if err == nil {
+			if relayPID > 0 && pid == relayPID {
+				return true
+			}
+			if relayPath != "" && process != "" && (relayPath == process || strings.EqualFold(filepath.Base(relayPath), filepath.Base(process))) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (ph *ProxyHandler) needsProcessMetadata() bool {
-	return ph.rm != nil && ph.rm.HasProcessMetadataRules()
+	return (ph.rm != nil && ph.rm.HasProcessMetadataRules()) || ph.hasLocalUpstream()
 }
 
 func (ph *ProxyHandler) StartSocks() error {
@@ -259,10 +307,10 @@ func (ph *ProxyHandler) StartTransparent() error {
 		SetDialerControl(tproxy.GetDialerControl())
 		for _, upstream := range ph.sm.GetServers() {
 			if u, err := url.Parse(upstream); err == nil && isLoopbackUpstream(u.Hostname()) {
-				Warnf("[TUN/W] Loopback upstream %s delegates remote dialing to another process; its outbound sockets may be captured by the /1 TUN routes", upstream)
+				Warnf("[TUN/W] Loopback upstream %s delegates remote dialing to another process; its outbound sockets may be captured by the /1 TUN routes unless configured in bypass_nodes", upstream)
 			}
 		}
-		return tproxy.StartWindowsTransparent(context.Background(), ph.sm.GetServers(), func(conn net.Conn) {
+		return tproxy.StartWindowsTransparent(context.Background(), ph.sm.GetServers(), ph.BypassNodes, func(conn net.Conn) {
 			defer conn.Close()
 			target, err := tproxy.GetOriginalDst(conn)
 			if err != nil {
@@ -797,6 +845,10 @@ func (ph *ProxyHandler) dialTargetTLS(target string, process string, pid int) (*
 }
 
 func (ph *ProxyHandler) dialTarget(target string, process string, pid int) (net.Conn, error) {
+	if ph.isLocalRelay(process, pid) {
+		Debugf("[Dial] Target %s initiated by local relay process %s (PID: %d), routing directly to avoid loop", target, process, pid)
+		return ph.dialDirect(target)
+	}
 	host, portStr, _ := net.SplitHostPort(target)
 	port, _ := strconv.Atoi(portStr)
 	action, _ := ph.rm.MatchContext(MatchContext{Host: host, Port: port, Process: process, PID: pid})
@@ -874,6 +926,15 @@ func (ph *ProxyHandler) dialTargetUDP(target string, process string, pid int) (n
 	dialRetryCount := ph.DialRetryCount
 	if dialRetryCount <= 0 {
 		dialRetryCount = 3
+	}
+
+	if ph.isLocalRelay(process, pid) {
+		Debugf("[Dial UDP] Target %s initiated by local relay process %s (PID: %d), routing directly to avoid loop", target, process, pid)
+		d := net.Dialer{
+			Timeout: dialTimeout,
+			Control: GetDialerControl(),
+		}
+		return d.Dial("udp", target)
 	}
 
 	action, _ := ph.rm.MatchContext(MatchContext{Host: host, Port: port, Process: process, PID: pid})

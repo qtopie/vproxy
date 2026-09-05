@@ -10,6 +10,6 @@ import (
 )
 
 // StartWindowsTransparent is a no-op on non-Windows platforms.
-func StartWindowsTransparent(_ context.Context, _ []string, _ func(net.Conn), _ func(context.Context, net.Conn, string)) error {
+func StartWindowsTransparent(_ context.Context, _ []string, _ []string, _ func(net.Conn), _ func(context.Context, net.Conn, string)) error {
 	return fmt.Errorf("StartWindowsTransparent not supported on this platform")
 }

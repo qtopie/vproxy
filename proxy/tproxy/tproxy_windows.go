@@ -113,7 +113,7 @@ func ReadFromUDPWithOrigDst(conn *net.UDPConn, b, oob []byte) (int, *net.UDPAddr
 // StartWindowsTransparent is the entry point for the Windows transparent proxy.
 // It creates a Wintun TUN device, sets up a gvisor userspace TCP/IP stack,
 // and configures split routing so all traffic is intercepted.
-func StartWindowsTransparent(ctx context.Context, upstreams []string, tcpHandler func(net.Conn), udpHandler func(context.Context, net.Conn, string)) (err error) {
+func StartWindowsTransparent(ctx context.Context, upstreams []string, bypassNodes []string, tcpHandler func(net.Conn), udpHandler func(context.Context, net.Conn, string)) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			cleanupWindowsState()
@@ -284,7 +284,7 @@ func StartWindowsTransparent(ctx context.Context, upstreams []string, tcpHandler
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
 
 	// 6. Configure OS routing directly via Windows IP Helper API (LUID) to direct all traffic through the TUN.
-	return setupRoutingWindowsLUID(luid, upstreams)
+	return setupRoutingWindowsLUID(luid, upstreams, bypassNodes)
 }
 
 // bridgeTunWindows shuttles raw IP packets between the Wintun device and gvisor.
@@ -354,7 +354,7 @@ func generateGUIDByDeviceName(name string) *windows.GUID {
 
 // setupRoutingWindowsLUID assigns an IP to the Wintun adapter and adds two /1 routes
 // via the native Windows IP Helper API (iphlpapi.dll) directly using its NET_LUID.
-func setupRoutingWindowsLUID(luid winipcfg.LUID, upstreams []string) error {
+func setupRoutingWindowsLUID(luid winipcfg.LUID, upstreams []string, bypassNodes []string) error {
 	// Assign static IPv4 198.18.0.1/15 to the Wintun adapter.
 	prefix, err := netip.ParsePrefix("198.18.0.1/15")
 	if err != nil {
@@ -404,14 +404,14 @@ func setupRoutingWindowsLUID(luid winipcfg.LUID, upstreams []string) error {
 		}
 		installedRoutes = append(installedRoutes, r)
 	}
-	if err := setupUpstreamBypassRoutes(luid, upstreams); err != nil {
+	if err := setupUpstreamBypassRoutes(luid, upstreams, bypassNodes); err != nil {
 		cleanupInstalledRoutes(luid, installedRoutes)
 		return err
 	}
 	return nil
 }
 
-func setupUpstreamBypassRoutes(tunLUID winipcfg.LUID, upstreams []string) error {
+func setupUpstreamBypassRoutes(tunLUID winipcfg.LUID, upstreams []string, bypassNodes []string) error {
 	routes, err := winipcfg.GetIPForwardTable2(windows.AF_INET)
 	if err != nil {
 		return fmt.Errorf("enumerate physical routes: %w", err)
@@ -434,7 +434,34 @@ func setupUpstreamBypassRoutes(tunLUID winipcfg.LUID, upstreams []string) error 
 		return nil
 	}
 
-	seen := make(map[netip.Addr]struct{})
+	seenPrefix := make(map[netip.Prefix]struct{})
+	installPrefix := func(prefix netip.Prefix) error {
+		if !prefix.IsValid() || !prefix.Addr().Is4() {
+			return nil
+		}
+		if _, ok := seenPrefix[prefix]; ok {
+			return nil
+		}
+		seenPrefix[prefix] = struct{}{}
+		row := winipcfg.MibIPforwardRow2{}
+		row.Init()
+		row.InterfaceLUID = physical.InterfaceLUID
+		row.Metric = 1
+		if err := row.DestinationPrefix.SetPrefix(prefix); err != nil {
+			return fmt.Errorf("set bypass route %s: %w", prefix, err)
+		}
+		if err := row.NextHop.SetAddr(nextHop); err != nil {
+			return fmt.Errorf("set bypass gateway %s: %w", nextHop, err)
+		}
+		if err := row.Create(); err != nil {
+			return fmt.Errorf("create bypass route %s: %w", prefix, err)
+		}
+		winTunBypassRoutes = append(winTunBypassRoutes, winBypassRoute{
+			luid: physical.InterfaceLUID, prefix: prefix, nextHop: nextHop,
+		})
+		return nil
+	}
+
 	for _, upstream := range upstreams {
 		u, err := url.Parse(upstream)
 		if err != nil || u.Hostname() == "" || isLocalBypassAddress(u.Hostname()) {
@@ -449,27 +476,42 @@ func setupUpstreamBypassRoutes(tunLUID winipcfg.LUID, upstreams []string) error 
 			if !ok || !addr.Is4() {
 				continue
 			}
-			if _, ok := seen[addr]; ok {
+			if err := installPrefix(netip.PrefixFrom(addr, 32)); err != nil {
+				return err
+			}
+		}
+	}
+
+	for _, node := range bypassNodes {
+		node = strings.TrimSpace(node)
+		if node == "" {
+			continue
+		}
+		if prefix, err := netip.ParsePrefix(node); err == nil {
+			if err := installPrefix(prefix); err != nil {
+				return err
+			}
+			continue
+		}
+		if addr, err := netip.ParseAddr(node); err == nil {
+			if err := installPrefix(netip.PrefixFrom(addr, 32)); err != nil {
+				return err
+			}
+			continue
+		}
+		ips, err := net.LookupIP(node)
+		if err != nil {
+			log.Printf("[TUN/W] Warning: could not resolve bypass node %s: %v", node, err)
+			continue
+		}
+		for _, ip := range ips {
+			addr, ok := netip.AddrFromSlice(ip)
+			if !ok || !addr.Is4() {
 				continue
 			}
-			seen[addr] = struct{}{}
-			prefix := netip.PrefixFrom(addr, 32)
-			row := winipcfg.MibIPforwardRow2{}
-			row.Init()
-			row.InterfaceLUID = physical.InterfaceLUID
-			row.Metric = 1
-			if err := row.DestinationPrefix.SetPrefix(prefix); err != nil {
-				return fmt.Errorf("set upstream bypass route %s: %w", addr, err)
+			if err := installPrefix(netip.PrefixFrom(addr, 32)); err != nil {
+				return err
 			}
-			if err := row.NextHop.SetAddr(nextHop); err != nil {
-				return fmt.Errorf("set upstream bypass gateway %s: %w", nextHop, err)
-			}
-			if err := row.Create(); err != nil {
-				return fmt.Errorf("create upstream bypass route %s: %w", addr, err)
-			}
-			winTunBypassRoutes = append(winTunBypassRoutes, winBypassRoute{
-				luid: physical.InterfaceLUID, prefix: prefix, nextHop: nextHop,
-			})
 		}
 	}
 	return nil
