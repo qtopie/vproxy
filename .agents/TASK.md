@@ -51,3 +51,11 @@
 - 2026-09-05 10:01: Drafted SPEC-WIN-008 to validate Windows Wintun/gVisor inbound checksum handling and TCP relay payload exchange with native `curl.exe -v`; awaiting approval.
 - 2026-09-05 10:04: SPEC-WIN-008 approved and implemented. The Windows channel endpoint now advertises `CapabilityRXChecksumOffload`, and packets read from Wintun are marked `RXChecksumValidated` before gVisor injection. Targeted `go test ./proxy/tproxy ./socks` and `go test ./tests/socks5` passed. Live TUN verification with `curl.exe` remains required.
 - 2026-09-05 10:09: Live verification after SPEC-WIN-008: peer DNS returned Fake-IP and TCP connect to `www.google.com:443` succeeded. Native `curl.exe` still failed TLS, and plain HTTP through the TUN produced an empty response. Verbose Relay logs show the client request reaches the upstream (`R -> L` copied 75 bytes for `GET /`), but the SOCKS5 connection returned zero response bytes before closing; this does not support the inbound checksum-drop hypothesis. Added Wintun write error reporting and packet-buffer release. Also fixed background `-v` argument placement so `vproxy -v init` enables daemon debug logs. Mandatory cleanup completed.
+- 2026-09-05 10:14: Root cause diagnosis for `L -> R: copied 0 bytes`: Upstream SOCKS5 Routing Loop Deadlock.
+  1. Root cause: Wintun `/1` routes (`0.0.0.0/1` and `128.0.0.0/1`) capture all host traffic. `vproxy.exe` uses `IP_UNICAST_IF` on its own sockets, but the separate SOCKS5 proxy process (or WSL2 relay) at `127.0.0.1:1080` has no socket-binding protection. When SOCKS5 attempts to dial the destination (`www.google.com:443` or its remote VPS node), Windows routes its outbound SYN packets back into Wintun, causing recursive re-interception and immediate connection termination.
+  2. Standalone SOCKS5 test works because no `/1` routes exist when TUN is inactive.
+  3. Identified mitigations:
+     - Static `/32` route to physical gateway for remote proxy node IP (bypasses `/1` routes).
+     - WSL2 network bridge routing isolation or mirrored networking mode.
+     - Process/PID-level upstream loop detection using `tproxy.GetProcessNameByConn` to prevent re-intercepting the proxy process.
+     - Half-close (`CloseWrite`) support in `internal/tcp.go:Relay` instead of hard `Close()` on EOF.
