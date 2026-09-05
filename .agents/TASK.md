@@ -71,5 +71,5 @@
   - Added automatic listener PID detection (`isLocalRelay`) in `internal/handler.go` for loopback upstreams, routing intercepted relay traffic via `ph.dialDirect` (with `IP_UNICAST_IF` socket binding).
   - Added unit test `TestConfig_BypassNodesJSON` in `internal/config_test.go` and `TestWindows_BypassNodesRouteSetup` in `proxy/tproxy/routing_windows_test.go`.
   - Verified with `./scripts/check.sh`, Linux unit tests, Windows cross-compilation (`GOOS=windows go build`), and Windows test binaries. All tests passed cleanly.
-
+- 2026-09-05 10:35: Revalidated commit `3280f5a` on `main`. The full local suite is not clean on this host: pre-existing Windows CA-path and winipcfg test-interface failures remain, and the new bypass-route cleanup test exposed a real edge case when `winTunLUID == 0`; fixed cleanup to always delete tracked bypass routes. Targeted tests and Windows build pass. Live guarded verification still gets Fake-IP DNS and TCP 443, but native HTTPS fails; logs show no `isLocalRelay` direct-forward diagnostic, so the WSL relay process is not being identified by the current Windows TCP-table lookup.
 

@@ -536,18 +536,19 @@ func Cleanup() {
 }
 
 func cleanupWindowsState() {
-	if winTunLUID != 0 {
-		for _, route := range winTunBypassRoutes {
-			row := winipcfg.MibIPforwardRow2{}
-			row.Init()
-			row.InterfaceLUID = route.luid
-			if err := row.DestinationPrefix.SetPrefix(route.prefix); err == nil {
-				if err := row.NextHop.SetAddr(route.nextHop); err == nil {
-					_ = row.Delete()
-				}
+	for _, route := range winTunBypassRoutes {
+		row := winipcfg.MibIPforwardRow2{}
+		row.Init()
+		row.InterfaceLUID = route.luid
+		if err := row.DestinationPrefix.SetPrefix(route.prefix); err == nil {
+			if err := row.NextHop.SetAddr(route.nextHop); err == nil {
+				_ = row.Delete()
 			}
 		}
-		winTunBypassRoutes = nil
+	}
+	winTunBypassRoutes = nil
+
+	if winTunLUID != 0 {
 		if winTunDNS != nil {
 			_ = winTunLUID.SetDNS(winipcfg.AddressFamily(windows.AF_INET), winTunDNS, nil)
 			winTunDNS = nil
