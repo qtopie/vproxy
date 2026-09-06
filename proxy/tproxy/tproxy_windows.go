@@ -466,9 +466,30 @@ func setupUpstreamBypassRoutes(tunLUID winipcfg.LUID, upstreams []string, bypass
 		return nil
 	}
 
+	// Always bypass private/LAN ranges at the OS routing-table level so that
+	// traffic destined for local addresses never enters the TUN device.
+	// This mirrors the macOS pf `private_ips` table and prevents the upstream
+	// proxy (which lives on a private subnet) from being looped through itself.
+	privatePrefixes := []string{
+		"127.0.0.0/8",     // loopback
+		"10.0.0.0/8",     // RFC1918
+		"172.16.0.0/12",  // RFC1918
+		"192.168.0.0/16", // RFC1918
+		"169.254.0.0/16", // link-local
+	}
+	for _, p := range privatePrefixes {
+		prefix, err := netip.ParsePrefix(p)
+		if err != nil {
+			continue
+		}
+		if err := installPrefix(prefix); err != nil {
+			log.Printf("[TUN/W] Warning: could not install private bypass route %s: %v", p, err)
+		}
+	}
+
 	for _, upstream := range upstreams {
 		u, err := url.Parse(upstream)
-		if err != nil || u.Hostname() == "" || isLoopbackAddress(u.Hostname()) {
+		if err != nil || u.Hostname() == "" {
 			continue
 		}
 		ips, err := net.LookupIP(u.Hostname())
@@ -480,6 +501,8 @@ func setupUpstreamBypassRoutes(tunLUID winipcfg.LUID, upstreams []string, bypass
 			if !ok || !addr.Is4() {
 				continue
 			}
+			// /32 for upstream proxy – redundant if it falls inside a private
+			// prefix above, but kept for explicitness and IPv4-mapped edge cases.
 			if err := installPrefix(netip.PrefixFrom(addr, 32)); err != nil {
 				return err
 			}
