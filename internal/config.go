@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -67,6 +68,7 @@ func LoadConfig(path string) (*Config, string, error) {
 	}
 
 	// 5. Parse the data
+	data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, "", err

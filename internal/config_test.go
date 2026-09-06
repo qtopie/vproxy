@@ -3,6 +3,7 @@ package internal
 import (
 	"encoding/json"
 	"net"
+	"os"
 	"testing"
 	"time"
 )
@@ -85,6 +86,32 @@ func TestProxyHandler_IsForwardedRelay(t *testing.T) {
 	phNoUpstream := NewProxyHandler(NewServerManager([]string{"socks5://1.2.3.4:1080"}, 1*time.Minute, 1*time.Second), rm, 0, 0, 0, 0)
 	if phNoUpstream.isForwardedRelay(wslConn, false, 0) {
 		t.Fatalf("expected isForwardedRelay to be false when no local upstream is configured")
+	}
+}
+
+func TestLoadConfig_UTF8BOM(t *testing.T) {
+	// Scenario: Windows Notepad or PowerShell Set-Content UTF-8 file with BOM
+	raw := []byte("\xef\xbb\xbf{\n  \"upstreams\": [\"socks5://127.0.0.1:1080\"],\n  \"rules\": [\"127.0.0.1,DIRECT\"]\n}")
+	tmpFile, err := os.CreateTemp("", "vproxy_bom_*.json")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.Write(raw); err != nil {
+		t.Fatalf("failed to write temp file: %v", err)
+	}
+	_ = tmpFile.Close()
+
+	cfg, loadedPath, err := LoadConfig(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig failed on UTF-8 BOM: %v", err)
+	}
+	if loadedPath != tmpFile.Name() {
+		t.Errorf("expected loadedPath %s, got %s", tmpFile.Name(), loadedPath)
+	}
+	if len(cfg.Upstreams) != 1 || cfg.Upstreams[0] != "socks5://127.0.0.1:1080" {
+		t.Errorf("unexpected upstreams: %v", cfg.Upstreams)
 	}
 }
 

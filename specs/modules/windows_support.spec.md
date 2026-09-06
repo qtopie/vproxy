@@ -128,6 +128,12 @@
 - **And** `third_party/wintun` 的 `Load()` 必须在 `LoadLibraryEx` 中允许检索用户目录（`LOAD_LIBRARY_SEARCH_USER_DIRS`）并在必要时使用绝对路径或系统默认搜索策略进行兜底加载
 - **Mapped Test:** `proxy/tproxy/routing_windows_test.go:TestWindows_WintunLoadPath`
 
+#### Scenario 14: [SPEC-WIN-014] Windows 配置文件 UTF-8 BOM 容错解析
+- **Given** Windows 用户使用 Notepad 或 PowerShell `Set-Content -Encoding UTF8` 保存的配置文件
+- **When** 配置文件头部包含 UTF-8 BOM 字节序列 (`0xEF, 0xBB, 0xBF`)
+- **Then** `LoadConfig` 必须自动剥离开头的 BOM 标记再进行 JSON 解码，不得抛出 `invalid character '﻿' looking for beginning of value`
+
+
 ### Feature: Windows 平台状态查询适配
 
 #### Scenario 12: [SPEC-WIN-012] Windows 平台下 vproxy status 适配与免 IPC 查询
