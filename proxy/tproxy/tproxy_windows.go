@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -227,7 +228,7 @@ func StartWindowsTransparent(ctx context.Context, upstreams []string, bypassNode
 	// 4. TCP forwarder — intercepts all TCP connections entering the TUN.
 	tcpFwd := tcp.NewForwarder(s, 0, 10000, func(r *tcp.ForwarderRequest) {
 		ep := r.ID()
-		target := fmt.Sprintf("%s:%d", ep.LocalAddress, ep.LocalPort)
+		target := net.JoinHostPort(ep.LocalAddress.String(), strconv.Itoa(int(ep.LocalPort)))
 		log.Printf("[TUN/W] TCP → %s", target)
 
 		var wq waiter.Queue
@@ -244,7 +245,7 @@ func StartWindowsTransparent(ctx context.Context, upstreams []string, bypassNode
 	// 5. UDP forwarder — wraps the intercepted endpoint (not an outbound dial).
 	udpFwd := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
 		ep := r.ID()
-		target := fmt.Sprintf("%s:%d", ep.LocalAddress, ep.LocalPort)
+		target := net.JoinHostPort(ep.LocalAddress.String(), strconv.Itoa(int(ep.LocalPort)))
 
 		// Intercept DNS (port 53)
 		if ep.LocalPort == 53 && (ep.LocalAddress.String() == "198.18.0.1" || ep.LocalAddress.String() == "198.18.0.2") {

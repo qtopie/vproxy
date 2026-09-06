@@ -4,6 +4,7 @@
 package tproxy
 
 import (
+	"net"
 	"net/netip"
 	"testing"
 
@@ -119,5 +120,26 @@ func TestWindows_WintunLoadPath(t *testing.T) {
 	// In non-Windows runtime or test sandbox, ensure clean state
 	cleanupWindowsState()
 }
+
+func TestWindows_IPv6TargetFormatting(t *testing.T) {
+	// SPEC-WIN-016: Verify that IPv6 addresses are properly bracketed when constructing target address
+	ipv6Addr := net.ParseIP("fe80::1")
+	port := 53
+	target := net.JoinHostPort(ipv6Addr.String(), "53")
+	expected := "[fe80::1]:53"
+	if target != expected {
+		t.Fatalf("expected formatted IPv6 target %s, got %s", expected, target)
+	}
+
+	host, portStr, err := net.SplitHostPort(target)
+	if err != nil {
+		t.Fatalf("SplitHostPort failed for formatted IPv6 target %s: %v", target, err)
+	}
+	if host != "fe80::1" || portStr != "53" {
+		t.Fatalf("unexpected host %s or port %s", host, portStr)
+	}
+	_ = port
+}
+
 
 

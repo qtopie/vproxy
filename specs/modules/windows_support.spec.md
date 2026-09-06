@@ -138,6 +138,12 @@
 - **When** 前台进程拉起后台常驻守护进程
 - **Then** 传递给后台进程的 `-c` 参数必须转换为规范的绝对路径 (`filepath.Abs`)，以防止子进程因工作目录或环境变量差异无法定位原配置文件
 
+#### Scenario 16: [SPEC-WIN-016] 拦截网络包目标地址的 IPv6 格式化合规性
+- **Given** 从 TUN 或虚拟网络栈拦截到目的地址为 IPv6 的 TCP/UDP 网络包（例如 Link-Local DNS `fe80::1:53`）
+- **When** 构造拨号目标或上报目标地址字符串 (`target`)
+- **Then** 必须采用标准 `net.JoinHostPort`（或对 IPv6 带方括号 `[fe80::1]:53`），不得直接通过 `%s:%d` 字符串拼接，严禁因多冒号导致 `too many colons in address` 错误
+
+
 
 
 ### Feature: Windows 平台状态查询适配
