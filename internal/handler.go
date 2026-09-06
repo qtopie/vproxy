@@ -1165,6 +1165,37 @@ func dialHTTPWithTimeout(proxyAddr, target string, timeout time.Duration) (net.C
 }
 
 func (ph *ProxyHandler) dialDirect(target string) (net.Conn, error) {
+	host, port, splitErr := net.SplitHostPort(target)
+	if splitErr == nil {
+		domain := ""
+		ip := net.ParseIP(host)
+		if ip != nil && dns.GlobalPool != nil && dns.GlobalPool.IsFakeIP(ip) {
+			domain = dns.GlobalPool.GetDomain(ip)
+		} else if ip == nil {
+			domain = host
+		}
+
+		if domain != "" && runtime.GOOS == "windows" {
+			r := &net.Resolver{
+				PreferGo: true,
+				Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+					d := net.Dialer{
+						Timeout: 2 * time.Second,
+						Control: GetDialerControl(),
+					}
+					return d.DialContext(ctx, "udp", "223.5.5.5:53")
+				},
+			}
+			if ips, err := r.LookupIP(context.Background(), "ip4", domain); err == nil && len(ips) > 0 {
+				target = net.JoinHostPort(ips[0].String(), port)
+			} else {
+				target = net.JoinHostPort(domain, port)
+			}
+		} else if domain != "" {
+			target = net.JoinHostPort(domain, port)
+		}
+	}
+
 	retryCount := ph.DialRetryCount
 	if retryCount <= 0 {
 		retryCount = 3

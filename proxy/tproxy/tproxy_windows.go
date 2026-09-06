@@ -37,6 +37,7 @@ import (
 )
 
 var (
+	winPhysicalIfIdx int
 	winTunDevice tun.Device
 	winTunLUID   winipcfg.LUID
 	winTunDNS    []netip.Addr
@@ -137,6 +138,10 @@ func StartWindowsTransparent(ctx context.Context, upstreams []string, bypassNode
 	}
 
 	// 1. Create TUN device backed by the Wintun kernel driver.
+	if idx, err := getDefaultInterfaceIndex(); err == nil && idx > 0 {
+		winPhysicalIfIdx = idx
+		log.Printf("[TUN/W] Detected physical uplink interface index: %d", idx)
+	}
 	dllPath, err := wintunruntime.Ensure()
 	if err != nil {
 		return err
@@ -242,7 +247,7 @@ func StartWindowsTransparent(ctx context.Context, upstreams []string, bypassNode
 		target := fmt.Sprintf("%s:%d", ep.LocalAddress, ep.LocalPort)
 
 		// Intercept DNS (port 53)
-		if ep.LocalPort == 53 {
+		if ep.LocalPort == 53 && (ep.LocalAddress.String() == "198.18.0.1" || ep.LocalAddress.String() == "198.18.0.2") {
 			var wq waiter.Queue
 			endpoint, tcpipErr := r.CreateEndpoint(&wq)
 			if tcpipErr != nil {
@@ -462,7 +467,7 @@ func setupUpstreamBypassRoutes(tunLUID winipcfg.LUID, upstreams []string, bypass
 
 	for _, upstream := range upstreams {
 		u, err := url.Parse(upstream)
-		if err != nil || u.Hostname() == "" || isLocalBypassAddress(u.Hostname()) {
+		if err != nil || u.Hostname() == "" || isLoopbackAddress(u.Hostname()) {
 			continue
 		}
 		ips, err := net.LookupIP(u.Hostname())
@@ -609,6 +614,28 @@ func setsockoptInt(fd uintptr, level, opt, value int) error {
 // getDefaultInterfaceIndex uses iphlpapi!GetBestInterface to find the index of the
 // network interface used to reach the internet (i.e. the physical uplink, not TUN).
 func getDefaultInterfaceIndex() (int, error) {
+	if winPhysicalIfIdx > 0 {
+		return winPhysicalIfIdx, nil
+	}
+	routes, err := winipcfg.GetIPForwardTable2(windows.AF_INET)
+	if err == nil {
+		var physical *winipcfg.MibIPforwardRow2
+		for i := range routes {
+			row := &routes[i]
+			if row.DestinationPrefix.PrefixLength != 0 {
+				continue
+			}
+			if winTunLUID != 0 && row.InterfaceLUID == winTunLUID {
+				continue
+			}
+			if physical == nil || row.Metric < physical.Metric {
+				physical = row
+			}
+		}
+		if physical != nil && physical.InterfaceIndex > 0 {
+			return int(physical.InterfaceIndex), nil
+		}
+	}
 	dst := [4]byte{8, 8, 8, 8}
 	var idx uint32
 	ret, _, err := procGetBestInterface.Call(
@@ -633,19 +660,22 @@ func GetDialerControl() func(network, address string, c syscall.RawConn) error {
 	return func(network, address string, c syscall.RawConn) error {
 		host, _, splitErr := net.SplitHostPort(address)
 		if splitErr == nil {
-			if isLocalBypassAddress(host) {
+			if isLoopbackAddress(host) {
 				return nil
 			}
 		}
 		var opErr error
 		_ = c.Control(func(fd uintptr) {
+			// In Winsock, IP_UNICAST_IF for IPv4 takes an interface index in network byte order (htonl).
+			// IPV6_UNICAST_IF for IPv6 takes an interface index in host byte order.
+			netIfIdx := int(uint32(byte(ifIdx))<<24 | uint32(byte(ifIdx>>8))<<16 | uint32(byte(ifIdx>>16))<<8 | uint32(byte(ifIdx>>24)))
 			switch network {
 			case "tcp4", "udp4":
-				opErr = setsockoptInt(fd, syscall.IPPROTO_IP, ipUnicastIF, ifIdx)
+				opErr = setsockoptInt(fd, syscall.IPPROTO_IP, ipUnicastIF, netIfIdx)
 			case "tcp6", "udp6":
 				opErr = setsockoptInt(fd, syscall.IPPROTO_IPV6, ipv6UnicastIF, ifIdx)
 			default:
-				_ = setsockoptInt(fd, syscall.IPPROTO_IP, ipUnicastIF, ifIdx)
+				_ = setsockoptInt(fd, syscall.IPPROTO_IP, ipUnicastIF, netIfIdx)
 				_ = setsockoptInt(fd, syscall.IPPROTO_IPV6, ipv6UnicastIF, ifIdx)
 			}
 		})
@@ -653,7 +683,7 @@ func GetDialerControl() func(network, address string, c syscall.RawConn) error {
 	}
 }
 
-func isLocalBypassAddress(host string) bool {
+func isLoopbackAddress(host string) bool {
 	if strings.EqualFold(host, "localhost") {
 		return true
 	}
@@ -661,7 +691,7 @@ func isLocalBypassAddress(host string) bool {
 	if err != nil {
 		return false
 	}
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+	return ip.IsLoopback()
 }
 
 // StartDarwinTransparent is not supported on Windows.

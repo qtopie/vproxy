@@ -108,7 +108,19 @@
 
 ### Feature: 内置 Wintun 驱动自解压与多路径加载兼容
 
-#### Scenario 11: [SPEC-WIN-011] Wintun 驱动自解压与多路径加载策略
+#### Scenario 11: [SPEC-WIN-011] 私网上游与局域网节点防环路
+- **Given** Windows transparent TUN 模式已启动并注入了全局 `/1` 拦截路由
+- **When** 上游代理服务器位于局域网/私网网段（如 `192.168.0.0/16`, `10.0.0.0/8`, `172.16.0.0/12`）
+- **Then** 启动时必须向物理网关添加该上游 IP 的 `/32` 明细直连路由
+- **And** `GetDialerControl` 对该上游 IP 必须绑定物理网卡索引 (`IP_UNICAST_IF`)，不得被误判为仅本地回环而跳过
+- **And** `vproxy` 自身发起的上游连接不得被重新捕获进入 Wintun
+
+#### Scenario 12: [SPEC-WIN-012] Fake-IP 直连出站域名回退解析
+- **Given** 某连接目的 IP 属于 `198.18.0.0/15` Fake-IP 网段
+- **When** 匹配规则为 `DIRECT` 或回退至物理链路直连
+- **Then** 必须还原出对应域名，并通过真实 DNS 进行公网解析后再建立连接，不得向物理网卡直接拨号 Fake-IP
+
+#### Scenario 13: [SPEC-WIN-013] Wintun 驱动自解压与多路径加载策略
 - **Given** Windows 宿主机尚未预装 wintun.dll
 - **When** 启动 Windows 透明代理模式并执行 `wintunruntime.Ensure()`
 - **Then** 程序优先尝试在可执行文件所在同级目录解压释放 `wintun.dll` 以满足 `LOAD_LIBRARY_SEARCH_APPLICATION_DIR`
