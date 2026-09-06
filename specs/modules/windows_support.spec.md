@@ -133,6 +133,12 @@
 - **When** 配置文件头部包含 UTF-8 BOM 字节序列 (`0xEF, 0xBB, 0xBF`)
 - **Then** `LoadConfig` 必须自动剥离开头的 BOM 标记再进行 JSON 解码，不得抛出 `invalid character '﻿' looking for beginning of value`
 
+#### Scenario 15: [SPEC-WIN-015] vproxy init 启动后台守护进程时必须解析为绝对配置文件路径
+- **Given** 用户在某个工作目录以相对路径（例如默认的 `vproxy.json`）执行 `vproxy init`
+- **When** 前台进程拉起后台常驻守护进程
+- **Then** 传递给后台进程的 `-c` 参数必须转换为规范的绝对路径 (`filepath.Abs`)，以防止子进程因工作目录或环境变量差异无法定位原配置文件
+
+
 
 ### Feature: Windows 平台状态查询适配
 

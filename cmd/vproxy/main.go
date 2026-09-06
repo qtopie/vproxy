@@ -100,6 +100,9 @@ func main() {
 		if err != nil {
 			vlink.Fatalf("init failed: %v", err)
 		}
+		if absPath, err := filepath.Abs(resolvedPath); err == nil {
+			resolvedPath = absPath
+		}
 
 		binary, err := os.Executable()
 		if err == nil {
