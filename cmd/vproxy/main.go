@@ -213,11 +213,13 @@ func startBackgroundServer(config, pidFile string) error {
 	// Inherit environment but set a marker
 	cmd.Env = append(os.Environ(), "VP_BACKGROUND=1", "VP_READY_FILE="+readyFile)
 
-	// Open log file for background process in the system temp directory so it can be inspected
+	// In daemon mode, child process automatically sets up bounded rotating file logging in InitBackgroundLogging.
+	// We open stdout/stderr to a temporary discard or initial log handle without raw unbounded append.
 	logFile := filepath.Join(os.TempDir(), "vproxy.log")
-	f, _ := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	cmd.Stdout = f
-	cmd.Stderr = f
+	if rw, err := vlink.NewRotatingWriter(logFile, 10*1024*1024, 1); err == nil {
+		cmd.Stdout = rw
+		cmd.Stderr = rw
+	}
 
 	err := cmd.Start()
 	if err != nil {

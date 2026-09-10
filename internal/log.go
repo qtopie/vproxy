@@ -5,6 +5,7 @@ import (
 	"io"
 	stdlog "log"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 
@@ -185,6 +186,19 @@ func (stdLogBridge) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
+// InitBackgroundLogging initializes bounded rotating file logging when running in daemon mode.
+func InitBackgroundLogging() {
+	if os.Getenv("VP_BACKGROUND") != "1" {
+		return
+	}
+	logFile := filepath.Join(os.TempDir(), "vproxy.log")
+	// Bound each log file to 10MB, keep 1 backup file -> Max 20MB total footprint
+	rw, err := NewRotatingWriter(logFile, 10*1024*1024, 1)
+	if err == nil {
+		SetOutput(rw)
+	}
+}
+
 func init() {
 	// Default level respects existing Config.Verbose
 	if shouldLog(LevelDebug) {
@@ -192,6 +206,7 @@ func init() {
 	} else {
 		SetLevel(LevelInfo)
 	}
+	InitBackgroundLogging()
 	// Redirect the standard library logger to our internal logger so all
 	// existing `log.Printf`, `log.Println`, etc. go through `internal`.
 	stdlog.SetFlags(0)

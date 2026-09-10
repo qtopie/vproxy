@@ -143,8 +143,14 @@
 - **When** 构造拨号目标或上报目标地址字符串 (`target`)
 - **Then** 必须采用标准 `net.JoinHostPort`（或对 IPv6 带方括号 `[fe80::1]:53`），不得直接通过 `%s:%d` 字符串拼接，严禁因多冒号导致 `too many colons in address` 错误
 
-
-
+#### Scenario 17: [SPEC-WIN-017] 后台守护进程日志滚动与体积上限保护 (Bounded Log File & Rotation)
+- **Given** 后台守护进程长期运行且拦截系统全局流量
+- **When** 守护进程向日志文件 (`vproxy.log`) 持续写入日志
+- **Then** 日志记录器必须启用滚动写入机制（Rotating Writer）
+- **And** 单个日志文件大小达到阈值（默认 10MB）时自动滚动归档（如 `vproxy.log.1`）并创建新日志文件
+- **And** 最多保留指定数量的备份文件（默认保留 1 份），超出上限的历史日志自动清理
+- **And** 日志总磁盘占用上限严格受限（≤ 20MB），严禁无限制追加耗尽磁盘空间
+- **Mapped Test:** `internal/rotating_writer_test.go:TestRotatingWriter_SizeBoundedAndRotates`
 
 ### Feature: Windows 平台状态查询适配
 
