@@ -81,22 +81,49 @@
   "upstreams": [
     "socks5://127.0.0.1:1080"
   ],
+
+  // 1. L4 Routing Rules: determine whether connection is DIRECT or PROXY
   "rules": [
     "PROCESS,/Applications/Telegram.app/Contents/MacOS/Telegram,DIRECT",
     "PROCESS,C:\\Program Files\\Telegram Desktop\\Telegram.exe,DIRECT",
-    "DOMAIN-SUFFIX,google.com,PROXY",
-    "IP-CIDR,192.168.0.0/16,DIRECT",
-    "FINAL,PROXY"
+    "google.com,PROXY",
+    "github.com,PROXY",
+    "FINAL,DIRECT"
+  ],
+
+  // 2. L7 Rewrites & Mock: Whistle-style URL rewriting, reverse proxy, and local file mock
+  "rewrites": [
+    // Regex matching: auto-append request path and query to local dev server
+    "/cafe123.cn\\/.*?\\.(html|js|css|png|jpg)/ http://127.0.0.1:3000",
+
+    // Regex capture groups: substitute $1, $2 dynamically
+    "/api.example.com\\/v1\\/(.*)/ http://127.0.0.1:8080/v2/$1",
+
+    // Wildcard matching: path substitution
+    "https://api.prod.com/service/* http://127.0.0.1:9000/$1",
+
+    // Local static file Mock: return file directly with CORS headers
+    "https://api.prod.com/v1/config file:///home/user/mock/config.json"
   ]
 }
 ```
 
-### Rule Syntax
-Rules are parsed and matched top-down:
+### Syntax Overview
+
+#### 1. L4 Proxy Rules (`rules`)
+Rules are parsed and matched top-down to determine connection routing:
 * **PROCESS**: Match full process executable path (contains matching, e.g. `PROCESS,Telegram,DIRECT`).
-* **DOMAIN-SUFFIX**: Match hosts ending in specific domain.
-* **IP-CIDR**: Match target IP ranges.
-* **FINAL**: Default fallback action (`PROXY` or `DIRECT`).
+* **Domain / Suffix**: Match domain name and all subdomains (e.g. `google.com,PROXY` matches `google.com` and `*.google.com`).
+* **FINAL / DEFAULT**: Default fallback action (`PROXY` or `DIRECT`).
+
+#### 2. L7 Request Rewrites & Mock (`rewrites`)
+Whistle-style application layer HTTP/HTTPS interception and local reverse proxying:
+* **Regex Rewrite** (`/pattern/flags target`): Full regex matching. If target has no path/query, original request path and query are automatically appended.
+* **Capture Groups** (`$1`, `$2`): Dynamic variable backfilling into target URL.
+* **Wildcards** (`pattern/* target/$1`): Wildcard asterisk path replacement.
+* **Local File Mock** (`pattern file:///path/to/file`): Intercepts request and serves the local file with HTTP 200 and permissive CORS headers.
+* **TLS Termination & Protocol Adaptation**: Transparently intercepts inbound HTTPS, decrypts traffic using dynamically generated Root CA certificates, and forwards plain HTTP to local dev servers without requiring local SSL setup.
+* **Host-Bucket Indexing**: Evaluates regex rules only against relevant hosts, guaranteeing zero overhead for unrelated traffic.
 
 ---
 

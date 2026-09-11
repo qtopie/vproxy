@@ -75,24 +75,42 @@ vproxy curl -v https://google.com
 
 ### 3. 配置文件
 
-在 Linux 下，默认的全局配置文件位于 `/etc/vproxy/config.json`。你可以通过编辑此文件来配置上游服务器和分流规则：
+在 Linux 下，默认的全局配置文件位于 `/etc/vproxy/config.json`（macOS/Windows 为 `~/.vproxy/config.json` 或本地 `vproxy.json`）。配置示例：
 
 ```json
 {
-  "upstreams": ["socks5://127.0.0.1:1080"],
-  "rules": [
-    "8.8.8.8,DIRECT",
-    "google.com,PROXY",
-    "FINAL,PROXY"
+  "upstreams": [
+    "socks5://127.0.0.1:1080"
   ],
-  "enable_ebpf": true
+
+  // 1. L4 传输层分流规则：控制流量直连 (DIRECT) 或走上游代理 (PROXY)
+  "rules": [
+    "PROCESS,Telegram,PROXY",
+    "google.com,PROXY",
+    "github.com,PROXY",
+    "FINAL,DIRECT"
+  ],
+
+  // 2. L7 应用层重写规则：支持类 Whistle 语法的前端本地热替换、接口反向代理与静态 Mock
+  "rewrites": [
+    // [正则] 静态资源透明打给本地 Vite/Webpack 开发服务 (自动追加 path 与 query)
+    "/cafe123.cn\\/.*?\\.(html|js|css|png|jpg)/ http://127.0.0.1:3000",
+
+    // [捕获组] 生产接口透明打给本地后端调试端口 ($1 动态替换)
+    "/api.example.com\\/v1\\/(.*)/ http://127.0.0.1:8080/v2/$1",
+
+    // [通配符] 路径前缀匹配
+    "https://api.prod.com/service/* http://127.0.0.1:9000/$1",
+
+    // [Mock] 生产接口直接返回本地 JSON 数据并自动注入跨域头
+    "https://api.prod.com/v1/config file:///home/user/mock/config.json"
+  ]
 }
 ```
 
 ## 🚧 未来计划
 
-- **抓包与流量分析**：集成类似 [whistle](https://github.com/avwo/whistle) 的功能，支持实时抓包、修改请求/响应内容、数据 Mock 等。
-- **Web UI 控制台**：提供直观的流量监控与规则管理界面。
+- **Web UI 控制台持续优化**：提供更直观的流量监控与规则在线编辑界面。
 - **更强的协议支持**：持续优化对 HTTP/2, gRPC 以及 QUIC 的透明拦截能力。
 
 ## 🛠️ 开发与构建
