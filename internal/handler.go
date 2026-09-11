@@ -159,6 +159,12 @@ type ProxyHandler struct {
 	udpSessions    sync.Map
 	ebpfResult     *ebpf.LoadResult
 	BypassNodes    []string
+	rewriteEngine  *RewriteEngine
+}
+
+// SetRewriteEngine sets the L7 HTTP/HTTPS request rewriting engine.
+func (ph *ProxyHandler) SetRewriteEngine(re *RewriteEngine) {
+	ph.rewriteEngine = re
 }
 
 // SetEbpfResult sets the eBPF load result containing maps for orig dst lookup.
@@ -654,41 +660,57 @@ func (ph *ProxyHandler) serveHTTP() {
 				return
 			}
 
-			// only support CONNECT method for MITM
-			if req.Method != http.MethodConnect {
-				res := http.Response{StatusCode: http.StatusMethodNotAllowed, ProtoMajor: 1, ProtoMinor: 1}
-				res.Write(conn)
-				return
-			}
-
 			process := ""
 			pid := 0
 			if (runtime.GOOS == "darwin" || runtime.GOOS == "windows") && ph.needsProcessMetadata() {
 				process, pid, _ = tproxy.GetProcessNameByConn(conn)
 			}
 
-			// Check if we should intercept this connection (MITM)
 			hostOnly := req.Host
 			if h, _, err := net.SplitHostPort(req.Host); err == nil {
 				hostOnly = h
 			}
-			action, _ := ph.rm.MatchContext(MatchContext{Host: hostOnly, Process: process, PID: pid})
 
-			// Deep HTTPS Tracing (MITM) when explicitly intercepted/mapped
-			if action == ActionIntercept || action == ActionMap {
-				// Establish TLS connection with the target server
-				serverTLS, err := ph.dialTargetTLS(req.Host, process, pid)
-				if err != nil {
-					log.Printf("MITM: failed to dial target TLS %s: %v", req.Host, err)
-					res := http.Response{StatusCode: http.StatusBadGateway, ProtoMajor: 1, ProtoMinor: 1}
-					res.Write(conn)
-					return
+			// 1. Plain HTTP proxy request (e.g. GET http://... or GET /...)
+			if req.Method != http.MethodConnect {
+				fullURL := req.URL.String()
+				if !strings.Contains(fullURL, "://") {
+					fullURL = fmt.Sprintf("http://%s%s", req.Host, req.URL.RequestURI())
+				}
+				if ph.rewriteEngine != nil {
+					if rwRes, ok := ph.rewriteEngine.Match(fullURL, hostOnly); ok {
+						if rwRes.Action == RewriteActionMock {
+							ph.serveLocalFile(conn, rwRes.LocalFile)
+							return
+						} else if rwRes.Action == RewriteActionProxy && rwRes.TargetURL != "" {
+							ph.forwardRewriteRequest(conn, req, rwRes.TargetURL, hostOnly, fullURL, time.Now())
+							return
+						}
+					}
+				}
+				ph.forwardPlainHTTPRequest(conn, req, hostOnly, process, pid)
+				return
+			}
+
+			action, _ := ph.rm.MatchContext(MatchContext{Host: hostOnly, Process: process, PID: pid})
+			isRewriteHost := ph.rewriteEngine != nil && ph.rewriteEngine.IsInterceptHost(hostOnly)
+
+			// 2. HTTPS CONNECT Tunnel (MITM when explicitly intercepted, mapped, or in rewrite rules)
+			if action == ActionIntercept || action == ActionMap || isRewriteHost {
+				// Establish TLS connection with the target server if not a dedicated rewrite host
+				var serverConn net.Conn
+				if !isRewriteHost {
+					if sTLS, err := ph.dialTargetTLS(req.Host, process, pid); err == nil && sTLS != nil {
+						serverConn = sTLS
+					}
 				}
 
-				// Respond 200 OK to the client
+				// Respond 200 OK to the client to establish tunnel
 				_, err = fmt.Fprintf(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
 				if err != nil {
-					serverTLS.Close()
+					if !isNilConn(serverConn) {
+						serverConn.Close()
+					}
 					return
 				}
 
@@ -696,7 +718,9 @@ func (ph *ProxyHandler) serveHTTP() {
 				leafCert, err := mitm.GetCertificateForHost(req.Host)
 				if err != nil {
 					log.Printf("MITM: failed to generate cert for %s: %v", req.Host, err)
-					serverTLS.Close()
+					if !isNilConn(serverConn) {
+						serverConn.Close()
+					}
 					return
 				}
 
@@ -706,12 +730,12 @@ func (ph *ProxyHandler) serveHTTP() {
 					NextProtos:   []string{"http/1.1"}, // Force HTTP/1.1 to simplify parsing
 				})
 
-				// Handle deep HTTP tracing
-				ph.handlePlainHTTP(clientTLS, serverTLS, req.Host)
+				// Handle deep HTTP tracing and rewriting
+				ph.handlePlainHTTP(clientTLS, serverConn, req.Host)
 				return
 			}
 
-			// 3. 向客户端回送 HTTP 200 Connection Established
+			// 3. Normal CONNECT Tunnel
 			_, err = fmt.Fprintf(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
 			if err != nil {
 				return
@@ -723,30 +747,94 @@ func (ph *ProxyHandler) serveHTTP() {
 	}
 }
 
+func isNilConn(c net.Conn) bool {
+	if c == nil {
+		return true
+	}
+	if tc, ok := c.(*tls.Conn); ok && tc == nil {
+		return true
+	}
+	return false
+}
+
 func (ph *ProxyHandler) handlePlainHTTP(client, server net.Conn, host string) {
 	defer client.Close()
-	defer server.Close()
+	if !isNilConn(server) {
+		defer server.Close()
+	}
 
 	clientReader := bufio.NewReader(client)
-	serverReader := bufio.NewReader(server)
+	var serverReader *bufio.Reader
+	if !isNilConn(server) {
+		serverReader = bufio.NewReader(server)
+	}
 
 	// Try reading the first request
 	req, err := http.ReadRequest(clientReader)
 	if err != nil {
-		// Fallback to relaying raw bytes
-		bufferedBytes, _ := clientReader.Peek(clientReader.Buffered())
-		if len(bufferedBytes) > 0 {
-			server.Write(bufferedBytes)
+		if !isNilConn(server) {
+			// Fallback to relaying raw bytes
+			bufferedBytes, _ := clientReader.Peek(clientReader.Buffered())
+			if len(bufferedBytes) > 0 {
+				server.Write(bufferedBytes)
+			}
+			Relay(context.Background(), server, client)
 		}
-		Relay(context.Background(), server, client)
 		return
 	}
 
 	for {
 		startTime := time.Now()
 
-		// 1. Whistle-like Mapping: Check if this specific URL should be hijacked
-		fullURL := fmt.Sprintf("https://%s%s", host, req.URL.RequestURI())
+		hostOnly := host
+		displayHost := host
+		if h, p, err := net.SplitHostPort(host); err == nil {
+			hostOnly = h
+			if p == "443" || p == "80" {
+				displayHost = h
+			}
+		}
+		fullURL := fmt.Sprintf("https://%s%s", displayHost, req.URL.RequestURI())
+
+		// 1. Check L7 RewriteEngine rules
+		if ph.rewriteEngine != nil {
+			if rwRes, ok := ph.rewriteEngine.Match(fullURL, hostOnly); ok {
+				if rwRes.Action == RewriteActionMock {
+					ph.serveLocalFile(client, rwRes.LocalFile)
+
+					traceID := fmt.Sprintf("mock-%04d", atomic.AddUint64(&traceCounter, 1))
+					PublishTrace(&TraceEntry{
+						ID:           traceID,
+						Timestamp:    startTime,
+						Method:       req.Method,
+						URL:          fullURL,
+						Path:         req.URL.Path,
+						Host:         host,
+						RequestProto: req.Proto,
+						StatusCode:   200,
+						RespHeaders:  http.Header{"X-VProxy-Mock": []string{rwRes.LocalFile}},
+						RespBody:     fmt.Sprintf("[Mocked Local File: %s]", rwRes.LocalFile),
+						LatencyMs:    float64(time.Since(startTime).Nanoseconds()) / 1e6,
+					})
+
+					req, err = http.ReadRequest(clientReader)
+					if err != nil {
+						return
+					}
+					continue
+				} else if rwRes.Action == RewriteActionProxy && rwRes.TargetURL != "" {
+					ph.forwardRewriteRequest(client, req, rwRes.TargetURL, host, fullURL, startTime)
+
+					req, err = http.ReadRequest(clientReader)
+					if err != nil {
+						return
+					}
+					continue
+				}
+			}
+		}
+
+		// 2. Check legacy Whistle-like Mapping from rules
 		action, target := ph.rm.MatchURL(fullURL)
 		if action == ActionMap && strings.HasPrefix(target, "file://") {
 			localPath := strings.TrimPrefix(target, "file://")
@@ -774,6 +862,12 @@ func (ph *ProxyHandler) handlePlainHTTP(client, server net.Conn, host string) {
 				return
 			}
 			continue
+		}
+
+		if isNilConn(server) {
+			res := http.Response{StatusCode: http.StatusBadGateway, ProtoMajor: 1, ProtoMinor: 1}
+			res.Write(client)
+			return
 		}
 
 		var reqBodyBytes []byte
@@ -874,7 +968,104 @@ func (ph *ProxyHandler) serveLocalFile(conn net.Conn, path string) {
 	res.Write(conn)
 }
 
+func (ph *ProxyHandler) forwardRewriteRequest(client net.Conn, req *http.Request, targetURL, origHost, origFullURL string, startTime time.Time) {
+	targetU, err := url.Parse(targetURL)
+	if err != nil {
+		log.Printf("Rewrite: invalid target URL %s: %v", targetURL, err)
+		res := http.Response{StatusCode: http.StatusBadGateway, ProtoMajor: 1, ProtoMinor: 1}
+		res.Write(client)
+		return
+	}
+
+	var reqBodyBytes []byte
+	if req.Body != nil {
+		reqBodyBytes, _ = io.ReadAll(req.Body)
+	}
+
+	outReq, err := http.NewRequest(req.Method, targetURL, bytes.NewReader(reqBodyBytes))
+	if err != nil {
+		log.Printf("Rewrite: failed to create outbound request: %v", err)
+		res := http.Response{StatusCode: http.StatusBadGateway, ProtoMajor: 1, ProtoMinor: 1}
+		res.Write(client)
+		return
+	}
+
+	outReq.Header = req.Header.Clone()
+	outReq.Header.Set("X-Forwarded-Proto", "https")
+	outReq.Header.Set("X-Forwarded-Host", origHost)
+	outReq.Host = targetU.Host
+
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout: 10 * time.Second,
+		}).DialContext,
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	resp, err := transport.RoundTrip(outReq)
+	if err != nil {
+		log.Printf("Rewrite: failed to forward request to %s: %v", targetURL, err)
+		res := http.Response{StatusCode: http.StatusBadGateway, ProtoMajor: 1, ProtoMinor: 1}
+		res.Write(client)
+		return
+	}
+	defer resp.Body.Close()
+
+	var respBodyBytes []byte
+	if resp.Body != nil {
+		respBodyBytes, _ = io.ReadAll(resp.Body)
+	}
+
+	latency := time.Since(startTime)
+	traceID := fmt.Sprintf("rw-%04d", atomic.AddUint64(&traceCounter, 1))
+	PublishTrace(&TraceEntry{
+		ID:           traceID,
+		Timestamp:    startTime,
+		Method:       req.Method,
+		URL:          origFullURL,
+		Path:         req.URL.Path,
+		Host:         origHost,
+		RequestProto: req.Proto,
+		ReqHeaders:   req.Header,
+		ReqBody:      ProcessBody(reqBodyBytes),
+		StatusCode:   resp.StatusCode,
+		RespHeaders:  resp.Header,
+		RespBody:     ProcessBody(respBodyBytes),
+		LatencyMs:    float64(latency.Nanoseconds()) / 1e6,
+	})
+
+	resp.Body = io.NopCloser(bytes.NewBuffer(respBodyBytes))
+	_ = resp.Write(client)
+}
+
+func (ph *ProxyHandler) forwardPlainHTTPRequest(client net.Conn, req *http.Request, hostOnly string, process string, pid int) {
+	target := req.Host
+	if !strings.Contains(target, ":") {
+		target = net.JoinHostPort(target, "80")
+	}
+	serverConn, err := ph.dialTarget(target, process, pid)
+	if err != nil {
+		res := http.Response{StatusCode: http.StatusBadGateway, ProtoMajor: 1, ProtoMinor: 1}
+		res.Write(client)
+		return
+	}
+	defer serverConn.Close()
+
+	if err := req.Write(serverConn); err != nil {
+		return
+	}
+	serverReader := bufio.NewReader(serverConn)
+	resp, err := http.ReadResponse(serverReader, req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	_ = resp.Write(client)
+}
+
 func (ph *ProxyHandler) dialTargetTLS(target string, process string, pid int) (*tls.Conn, error) {
+	if !strings.Contains(target, ":") {
+		target = net.JoinHostPort(target, "443")
+	}
 	conn, err := ph.dialTarget(target, process, pid)
 	if err != nil {
 		return nil, err
@@ -1097,6 +1288,30 @@ func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 	// For TUN/GVisor, target == LocalAddr is expected behavior, so we only check this for REDIRECT/eBPF modes.
 	if target == conn.LocalAddr().String() && !tproxy.IsTUNConn(conn) {
 		TraceErrorf(ctx, "Loop detected: target is the same as local address %s, dropping connection", target)
+		return
+	}
+
+	isRewriteHost := ph.rewriteEngine != nil && ph.rewriteEngine.IsInterceptHost(host)
+	isInterceptAction := false
+	if ph.rm != nil {
+		action, _ := ph.rm.MatchContext(MatchContext{Host: host, Process: process, PID: pid})
+		isInterceptAction = (action == ActionIntercept || action == ActionMap)
+	}
+
+	if port == "443" && (isRewriteHost || isInterceptAction) {
+		leafCert, err := mitm.GetCertificateForHost(host)
+		if err == nil {
+			clientTLS := tls.Server(conn, &tls.Config{
+				Certificates: []tls.Certificate{leafCert},
+				NextProtos:   []string{"http/1.1"},
+			})
+			serverTLS, _ := ph.dialTargetTLS(target, process, pid)
+			ph.handlePlainHTTP(clientTLS, serverTLS, host)
+			return
+		}
+	} else if port == "80" && (isRewriteHost || isInterceptAction) {
+		serverPlain, _ := ph.dialTarget(target, process, pid)
+		ph.handlePlainHTTP(conn, serverPlain, host)
 		return
 	}
 

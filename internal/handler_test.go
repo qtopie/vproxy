@@ -177,3 +177,82 @@ func TestProcessBody(t *testing.T) {
 		t.Errorf("Expected '[1.5KB:binary]', got '%s'", got)
 	}
 }
+
+func TestProxyHandler_EndToEndRewrite(t *testing.T) {
+	// Ensure CA
+	if err := mitm.EnsureCA(); err != nil {
+		t.Fatalf("Failed to ensure CA: %v", err)
+	}
+
+	// 1. Mock local backend (e.g. Vite/Node dev server on http)
+	var capturedPath string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		w.Header().Set("X-Powered-By", "mock-backend")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"rewritten":true}`))
+	}))
+	defer backend.Close()
+
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatalf("Failed to parse backend URL: %v", err)
+	}
+
+	// 2. Setup RewriteEngine
+	re, err := NewRewriteEngine([]string{
+		fmt.Sprintf("/mytest.local\\/api\\/(.*)/ %s/mock/$1", backend.URL),
+	})
+	if err != nil {
+		t.Fatalf("Failed to create RewriteEngine: %v", err)
+	}
+
+	sm := NewServerManager([]string{}, 1*time.Minute, 1*time.Second)
+	rm := NewRuleManager([]string{"FINAL,DIRECT"})
+	ph := NewProxyHandler(sm, rm, 0, 0, 0, 0)
+	ph.SetRewriteEngine(re)
+
+	if err := ph.StartHTTP(); err != nil {
+		t.Fatalf("Failed to start HTTP proxy: %v", err)
+	}
+	defer ph.Stop()
+
+	// 3. Setup client pointing to vproxy HTTP port with custom CA
+	caCertPool := x509.NewCertPool()
+	caCertBytes, err := os.ReadFile(mitm.GetCACertPath())
+	if err != nil {
+		t.Fatalf("Failed to read Root CA: %v", err)
+	}
+	caCertPool.AppendCertsFromPEM(caCertBytes)
+
+	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", ph.HttpPort))
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{
+				RootCAs:            caCertPool,
+				InsecureSkipVerify: false,
+			},
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	// 4. Client requests https://mytest.local/api/items
+	resp, err := client.Get("https://mytest.local/api/items")
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != `{"rewritten":true}` {
+		t.Errorf("unexpected body: %s", string(body))
+	}
+	if capturedPath != "/mock/items" {
+		t.Errorf("expected backend path /mock/items, got %s", capturedPath)
+	}
+	if backendURL == nil {
+		t.Fatalf("nil backendURL")
+	}
+}
+

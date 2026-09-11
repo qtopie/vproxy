@@ -643,6 +643,13 @@ func (a *App) setupServices() (*ServerManager, *ProxyHandler) {
 	if a.Config.DialRetryCount != nil {
 		ph.DialRetryCount = *a.Config.DialRetryCount
 	}
+	if len(a.Config.Rewrites) > 0 {
+		if re, err := NewRewriteEngine(a.Config.Rewrites); err == nil {
+			ph.SetRewriteEngine(re)
+		} else {
+			Errorf("Failed to initialize rewrites: %v", err)
+		}
+	}
 	return sm, ph
 }
 
@@ -669,6 +676,13 @@ func (a *App) watchConfig(path string, ph *ProxyHandler) {
 				}
 				ph.UpdateRules(cfg.Rules, directDNS)
 				ph.SetBypassNodes(cfg.BypassNodes)
+				if len(cfg.Rewrites) > 0 {
+					if re, err := NewRewriteEngine(cfg.Rewrites); err == nil {
+						ph.SetRewriteEngine(re)
+					}
+				} else {
+					ph.SetRewriteEngine(nil)
+				}
 				Debugf("Config reloaded")
 			}
 		}
