@@ -11,3 +11,4 @@ proxy/ebpf/tc_bpf_bpfel.go
 *.exe
 
 .agents/TASK.md
+scripts/__pycache__/
