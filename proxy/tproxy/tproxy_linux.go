@@ -18,6 +18,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/tun"
+	"github.com/qtopie/vproxy/internal/dns"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -149,10 +150,22 @@ func lookupTCPFromMap(conn net.Conn, m TCPOrigDstMap) (string, error) {
 		IP     [4]uint32
 		Port   uint32
 		Family uint32
+		Pid    uint32
+		Comm   [16]byte
 	}
 	var dst origDst
 	if err := m.LookupAndDelete(cookie, &dst); err != nil {
 		return "", err
+	}
+
+	if dst.Pid > 0 {
+		end := 0
+		for end < len(dst.Comm) && dst.Comm[end] != 0 {
+			end++
+		}
+		if rAddr, ok := tcpConn.RemoteAddr().(*net.TCPAddr); ok {
+			RecordProcessMetadata(rAddr.Port, int(dst.Pid), string(dst.Comm[:end]))
+		}
 	}
 
 	port := binary.BigEndian.Uint16((*[2]byte)(unsafe.Pointer(&dst.Port))[:])
@@ -176,6 +189,11 @@ func StartLinuxTransparent(ctx context.Context, tcpHandler func(net.Conn), udpHa
 
 	if tunDevice != nil {
 		return nil // already running
+	}
+
+	// 0. Initialize Fake-IP Pool
+	if err := dns.InitGlobalPool("198.18.0.0/15"); err != nil {
+		return fmt.Errorf("failed to init Fake-IP pool: %v", err)
 	}
 
 	// 1. Create TUN device
@@ -256,6 +274,27 @@ func StartLinuxTransparent(ctx context.Context, tcpHandler func(net.Conn), udpHa
 		}
 		endpoint := r.ID()
 		target := fmt.Sprintf("%s:%d", endpoint.LocalAddress, endpoint.LocalPort)
+
+		// Intercept DNS (port 53)
+		if endpoint.LocalPort == 53 {
+			go func() {
+				conn := gonet.NewUDPConn(&wq, ep)
+				defer conn.Close()
+				buf := make([]byte, 2048)
+				for {
+					n, remoteAddr, err := conn.ReadFrom(buf)
+					if err != nil {
+						return
+					}
+					if resp, domain, handled := dns.HijackPacket(buf[:n]); handled {
+						log.Printf("[TUN/L] DNS Hijacked: %s -> Fake-IP", domain)
+						conn.WriteTo(resp, remoteAddr)
+					}
+				}
+			}()
+			return true
+		}
+
 		go udpHandler(context.Background(), gonet.NewUDPConn(&wq, ep), target)
 		return true
 	}
@@ -356,14 +395,14 @@ func StartDarwinTransparent(_ context.Context, _, _, _ int, _ func(net.Conn), _ 
 	return fmt.Errorf("StartDarwinTransparent not supported on Linux")
 }
 
-// GetProcessNameByPort is not implemented on Linux.
-func GetProcessNameByPort(_ int) (string, int, error) {
-	return "", 0, fmt.Errorf("GetProcessNameByPort not implemented on Linux")
+// GetProcessNameByPort resolves the process name and PID by port on Linux.
+func GetProcessNameByPort(port int) (string, int, error) {
+	return ResolveProcessByPort(port)
 }
 
-// GetProcessNameByConn is not implemented on Linux.
-func GetProcessNameByConn(_ interface{}) (string, int, error) {
-	return "", 0, fmt.Errorf("GetProcessNameByConn not implemented on Linux")
+// GetProcessNameByConn resolves the process name and PID by connection on Linux.
+func GetProcessNameByConn(conn interface{}) (string, int, error) {
+	return ResolveProcessByConn(conn)
 }
 
 type icmpInterceptor struct {

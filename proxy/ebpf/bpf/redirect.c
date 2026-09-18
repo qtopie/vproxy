@@ -18,7 +18,15 @@ struct original_dst {
 	__u32 ip[4]; /* IPv4: ip[0] only (network byte order); IPv6: all 4 words */
 	__u32 port;  /* network byte order */
 	__u32 family; /* AF_INET or AF_INET6 */
+	__u32 pid;    /* caller TGID/PID */
+	char  comm[16]; /* task command name */
 };
+
+static __always_inline void fill_process_info(struct original_dst *dst) {
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	dst->pid = (__u32)(pid_tgid >> 32);
+	bpf_get_current_comm(dst->comm, sizeof(dst->comm));
+}
 
 /*
  * Key for the UDP original-destination map.
@@ -299,6 +307,7 @@ int sock4_connect(struct bpf_sock_addr *ctx) {
                 .port   = ctx->user_port, /* network byte order */
         };
         dst.ip[0] = ctx->user_ip4;
+        fill_process_info(&dst);
 
         if (ctx->protocol == IPPROTO_TCP) {
                 __u64 cookie = bpf_get_socket_cookie(ctx);
@@ -343,6 +352,7 @@ int sock4_sendmsg(struct bpf_sock_addr *ctx) {
                 .port   = ctx->user_port,
         };
         dst.ip[0] = ctx->user_ip4;
+        fill_process_info(&dst);
 
         struct udp_orig_key k = {
                 .src_port = ctx->sk->src_port, /* host byte order */
@@ -387,6 +397,7 @@ int sock6_connect(struct bpf_sock_addr *ctx) {
         dst.ip[1] = ctx->user_ip6[1];
         dst.ip[2] = ctx->user_ip6[2];
         dst.ip[3] = ctx->user_ip6[3];
+        fill_process_info(&dst);
 
         if (ctx->protocol == IPPROTO_TCP) {
                 __u64 cookie = bpf_get_socket_cookie(ctx);
@@ -440,6 +451,7 @@ int sock6_sendmsg(struct bpf_sock_addr *ctx) {
         dst.ip[1] = ctx->user_ip6[1];
         dst.ip[2] = ctx->user_ip6[2];
         dst.ip[3] = ctx->user_ip6[3];
+        fill_process_info(&dst);
 
         struct udp_orig_key k = {
                 .src_port = ctx->sk->src_port,

@@ -266,13 +266,10 @@ func StartWindowsTransparent(ctx context.Context, upstreams []string, bypassNode
 						}
 						return
 					}
-					resp, domain, err := dns.HandleDNSQuery(buf[:n])
-					if err != nil {
-						log.Printf("[TUN/W] DNS Handle error for %s: %v", domain, err)
-						continue
+					if resp, domain, handled := dns.HijackPacket(buf[:n]); handled {
+						log.Printf("[TUN/W] DNS Hijacked: %s -> Fake-IP", domain)
+						conn.WriteTo(resp, remoteAddr)
 					}
-					log.Printf("[TUN/W] DNS Hijacked: %s -> Fake-IP", domain)
-					conn.WriteTo(resp, remoteAddr)
 				}
 			}()
 			return true

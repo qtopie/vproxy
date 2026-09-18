@@ -24,6 +24,7 @@ import (
 
 	"github.com/qtopie/vproxy/internal/dns"
 	"github.com/qtopie/vproxy/internal/mitm"
+	"github.com/qtopie/vproxy/proxy/driver"
 	"github.com/qtopie/vproxy/proxy/ebpf"
 	"github.com/qtopie/vproxy/proxy/tproxy"
 	"github.com/qtopie/vproxy/socks"
@@ -160,6 +161,9 @@ type ProxyHandler struct {
 	ebpfResult     *ebpf.LoadResult
 	BypassNodes    []string
 	rewriteEngine  *RewriteEngine
+	driver         driver.InterceptDriver
+	inspector      driver.ProcessInspector
+	relayDetector  driver.RelayDetector
 }
 
 // SetRewriteEngine sets the L7 HTTP/HTTPS request rewriting engine.
@@ -180,6 +184,10 @@ func (ph *ProxyHandler) SetBypassNodes(nodes []string) {
 // NewProxyHandler constructs a ProxyHandler. Exported to allow callers in other packages
 // to create the handler without accessing internal fields directly.
 func NewProxyHandler(sm *ServerManager, rm *RuleManager, socksPort, httpPort, transPort, webPort int) *ProxyHandler {
+	var servers []string
+	if sm != nil {
+		servers = sm.GetServers()
+	}
 	return &ProxyHandler{
 		sm:             sm,
 		rm:             rm,
@@ -189,6 +197,8 @@ func NewProxyHandler(sm *ServerManager, rm *RuleManager, socksPort, httpPort, tr
 		WebPort:        webPort,
 		DialTimeout:    5000 * time.Millisecond, // Default 5 seconds
 		DialRetryCount: 3,                       // Default 3 attempts
+		inspector:      driver.NewProcessInspector(),
+		relayDetector:  driver.NewRelayDetector(servers),
 	}
 }
 
@@ -321,62 +331,48 @@ func (ph *ProxyHandler) StartTransparent() error {
 		return nil
 	}
 
-	if runtime.GOOS == "darwin" {
-		SetDialerControl(tproxy.GetDialerControl())
-		go func() {
-			err := tproxy.StartDarwinTransparent(context.Background(), ph.HttpPort, ph.SocksPort, ph.WebPort, func(conn net.Conn) {
-				defer conn.Close()
-				target, err := tproxy.GetOriginalDst(conn)
-				if err != nil {
-					log.Printf("Failed to get original destination: %v", err)
-					return
-				}
-				ph.forward(conn, target)
-			}, ph.handleUDP)
-			if err != nil {
-				log.Printf("Failed to start macOS transparent proxy: %v", err)
-			}
-		}()
-		return nil
+	SetDialerControl(tproxy.GetDialerControl())
+	_ = dns.InitGlobalPool("198.18.0.0/15")
+
+	if ph.driver == nil {
+		var servers []string
+		if ph.sm != nil {
+			servers = ph.sm.GetServers()
+		}
+		cfg := driver.DriverConfig{
+			TransPort:   ph.TransPort,
+			HttpPort:    ph.HttpPort,
+			SocksPort:   ph.SocksPort,
+			WebPort:     ph.WebPort,
+			Servers:     servers,
+			BypassNodes: ph.BypassNodes,
+			IsTUN:       os.Getenv("VP_USE_TUN") == "1",
+		}
+		ph.driver = driver.NewDriver(cfg)
 	}
 
-	if runtime.GOOS == "windows" {
-		SetDialerControl(tproxy.GetDialerControl())
-		for _, upstream := range ph.sm.GetServers() {
-			if u, err := url.Parse(upstream); err == nil && isLoopbackUpstream(u.Hostname()) {
-				Warnf("[TUN/W] Loopback upstream %s delegates remote dialing to another process; its outbound sockets may be captured by the /1 TUN routes unless configured in bypass_nodes", upstream)
+	// For drivers using dedicated routing/interfaces (TUN / PF)
+	if ph.driver.Name() == "windows-wintun" || ph.driver.Name() == "darwin-pf" || ph.driver.Name() == "linux-tun" {
+		if ph.driver.Name() == "windows-wintun" && ph.sm != nil {
+			for _, upstream := range ph.sm.GetServers() {
+				if u, err := url.Parse(upstream); err == nil && isLoopbackUpstream(u.Hostname()) {
+					Warnf("[TUN/W] Loopback upstream %s delegates remote dialing to another process; its outbound sockets may be captured by the /1 TUN routes unless configured in bypass_nodes", upstream)
+				}
 			}
 		}
-		return tproxy.StartWindowsTransparent(context.Background(), ph.sm.GetServers(), ph.BypassNodes, func(conn net.Conn) {
-			defer conn.Close()
-			target, err := tproxy.GetOriginalDst(conn)
-			if err != nil {
-				log.Printf("Failed to get original destination: %v", err)
-				return
-			}
-			ph.forward(conn, target)
-		}, ph.handleUDP)
-	}
-
-	if runtime.GOOS == "linux" && os.Getenv("VP_USE_TUN") == "1" {
-		SetDialerControl(tproxy.GetDialerControl())
 		go func() {
-			err := tproxy.StartLinuxTransparent(context.Background(), func(conn net.Conn) {
+			err := ph.driver.Start(context.Background(), func(conn net.Conn, target string) {
 				defer conn.Close()
-				target, err := tproxy.GetOriginalDst(conn)
-				if err != nil {
-					log.Printf("Failed to get original destination: %v", err)
-					return
-				}
 				ph.forward(conn, target)
-			}, ph.handleUDP)
+			}, func(conn net.Conn, target string) {
+				ph.handleUDP(context.Background(), conn, target)
+			})
 			if err != nil {
-				log.Printf("Failed to start Linux TUN transparent proxy: %v", err)
+				log.Printf("Failed to start transparent driver (%s): %v", ph.driver.Name(), err)
 			}
 		}()
 		return nil
 	}
-
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", ph.TransPort))
 	if err != nil {
 		Infof("Transparent proxy port %d is already in use, binding to a free port instead...", ph.TransPort)
@@ -427,11 +423,11 @@ func (ph *ProxyHandler) handleUDP(ctx context.Context, local net.Conn, target st
 	defer local.Close()
 	process := ""
 	pid := 0
-	if (runtime.GOOS == "darwin" || runtime.GOOS == "windows") && ph.needsProcessMetadata() {
-		process, pid, _ = tproxy.GetProcessNameByConn(local)
+	if ph.needsProcessMetadata() && ph.inspector != nil {
+		process, pid, _ = ph.inspector.GetProcessNameByConn(local)
 	}
 
-	if runtime.GOOS == "windows" && ph.isForwardedRelay(local, isFakeIP, pid) {
+	if ph.relayDetector != nil && ph.relayDetector.IsForwardedRelay(local, isFakeIP, pid) {
 		Debugf("[UDP] Detected forwarded UDP connection from virtual subsystem %s targeting %s (no host PID); routing DIRECT to prevent loop", local.RemoteAddr(), target)
 		d := net.Dialer{
 			Timeout: 5 * time.Second,
@@ -582,14 +578,27 @@ func (ph *ProxyHandler) serveTransparentUDP() {
 			continue // ignore packets without orig dst
 		}
 
+		// Intercept DNS (port 53) and respond with Fake-IP via unified DNSHijacker
+		if dst.Port == 53 {
+			if resp, domain, handled := dns.HijackPacket(buf[:n]); handled {
+				spoofConn, err := tproxy.DialUDPTransparent(dst)
+				if err == nil {
+					spoofConn.WriteToUDP(resp, src)
+					spoofConn.Close()
+					Debugf("[UDP] Intercepted DNS query for %s -> returned Fake-IP to %s", domain, src.String())
+					continue
+				}
+			}
+		}
+
 		sessionKey := src.String() + "|" + dst.String()
 		session, loaded := ph.udpSessions.Load(sessionKey)
 		var upstream net.Conn
 		if !loaded {
 			process := ""
 			pid := 0
-			if (runtime.GOOS == "darwin" || runtime.GOOS == "windows") && ph.needsProcessMetadata() {
-				process, pid, _ = tproxy.GetProcessNameByPort(src.Port)
+			if ph.needsProcessMetadata() && ph.inspector != nil {
+				process, pid, _ = ph.inspector.GetProcessNameByPort(src.Port)
 			}
 			Infof("[UDP] Intercepted new UDP session from %s (Process: %s, PID: %d) targeting %s", src.String(), process, pid, dst.String())
 			upstream, err = ph.dialTargetUDP(dst.String(), process, pid)
@@ -662,8 +671,8 @@ func (ph *ProxyHandler) serveHTTP() {
 
 			process := ""
 			pid := 0
-			if (runtime.GOOS == "darwin" || runtime.GOOS == "windows") && ph.needsProcessMetadata() {
-				process, pid, _ = tproxy.GetProcessNameByConn(conn)
+			if ph.needsProcessMetadata() && ph.inspector != nil {
+				process, pid, _ = ph.inspector.GetProcessNameByConn(conn)
 			}
 
 			hostOnly := req.Host
@@ -1270,8 +1279,8 @@ func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 
 	process := ""
 	pid := 0
-	if (runtime.GOOS == "darwin" || runtime.GOOS == "windows") && ph.needsProcessMetadata() {
-		process, pid, _ = tproxy.GetProcessNameByConn(conn)
+	if ph.needsProcessMetadata() && ph.inspector != nil {
+		process, pid, _ = ph.inspector.GetProcessNameByConn(conn)
 	}
 
 	traceID := fmt.Sprintf("conn-%04d", atomic.AddUint64(&traceCounter, 1))
@@ -1315,7 +1324,7 @@ func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 		return
 	}
 
-	if runtime.GOOS == "windows" && ph.isForwardedRelay(conn, isFakeIP, pid) {
+	if ph.relayDetector != nil && ph.relayDetector.IsForwardedRelay(conn, isFakeIP, pid) {
 		TraceInfof(ctx, "[TUN/W] Detected non-FakeIP outbound connection without host PID from %s targeting %s; routing DIRECT via physical interface to prevent loop", conn.RemoteAddr(), target)
 		rc, err := ph.dialDirect(target)
 		if err != nil {
@@ -1390,7 +1399,7 @@ func (ph *ProxyHandler) dialDirect(target string) (net.Conn, error) {
 			domain = host
 		}
 
-		if domain != "" && runtime.GOOS == "windows" {
+		if domain != "" && (runtime.GOOS == "windows" || runtime.GOOS == "linux") {
 			r := &net.Resolver{
 				PreferGo: true,
 				Dial: func(ctx context.Context, network, address string) (net.Conn, error) {

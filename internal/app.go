@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/qtopie/vproxy/internal/dns"
 	"github.com/qtopie/vproxy/internal/ipc"
 	"github.com/qtopie/vproxy/internal/mitm"
 	"github.com/qtopie/vproxy/proxy/cgroup"
@@ -127,6 +128,7 @@ func (a *App) getBestUpstream() string {
 }
 
 func (a *App) RunServer() {
+	_ = dns.InitGlobalPool("198.18.0.0/15")
 	sm, ph := a.setupServices()
 	a.ph = ph
 	sm.Start()
@@ -485,6 +487,28 @@ func (a *App) RunWrapper(args []string) {
 	// For tools that use env-vars (needsEbpf=false), we always proceed to set them.
 	if (skipPrivileged || needsTransparent) && needsEbpf {
 		Debugf("Transparent proxying active (skipPrivileged=%v), executing %s directly", skipPrivileged, cmdName)
+
+		// Inject proxy environment variables so downstream child processes running under this tool also inherit proxy support
+		httpPort := a.LocalHTTP
+		socksPort := a.LocalSocks
+		if httpPort == 0 {
+			httpPort = 8118
+		}
+		if socksPort == 0 {
+			socksPort = 1080
+		}
+		httpProxy := fmt.Sprintf("http://127.0.0.1:%d", httpPort)
+		socksProxy := fmt.Sprintf("socks5://127.0.0.1:%d", socksPort)
+		env = append(env,
+			fmt.Sprintf("http_proxy=%s", httpProxy),
+			fmt.Sprintf("https_proxy=%s", httpProxy),
+			fmt.Sprintf("all_proxy=%s", socksProxy),
+			fmt.Sprintf("HTTP_PROXY=%s", httpProxy),
+			fmt.Sprintf("HTTPS_PROXY=%s", httpProxy),
+			fmt.Sprintf("ALL_PROXY=%s", socksProxy),
+		)
+		env = a.appendNoProxyEnv(env)
+
 		cmd := exec.Command(cmdName, cmdArgs...)
 		cmd.Env = env
 		cmd.Stdout = os.Stdout

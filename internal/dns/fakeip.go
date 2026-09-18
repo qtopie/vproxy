@@ -91,6 +91,18 @@ func InitGlobalPool(cidr string) error {
 	return err
 }
 
+// HijackPacket inspects and handles a raw DNS packet, returning a synthetic response if handled.
+func HijackPacket(raw []byte) ([]byte, string, bool) {
+	if GlobalPool == nil {
+		return nil, "", false
+	}
+	resp, domain, err := HandleDNSQuery(raw)
+	if err != nil {
+		return nil, domain, false
+	}
+	return resp, domain, true
+}
+
 // Simple DNS packet handling
 
 func HandleDNSQuery(query []byte) ([]byte, string, error) {

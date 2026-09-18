@@ -115,3 +115,22 @@ func TestLoadConfig_UTF8BOM(t *testing.T) {
 	}
 }
 
+func TestApp_AppendNoProxyEnv(t *testing.T) {
+	app := &App{}
+	env := app.appendNoProxyEnv([]string{"PATH=/usr/bin"})
+	hasNoProxy := false
+	hasUpperNoProxy := false
+	for _, e := range env {
+		if e == "no_proxy=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16" {
+			hasNoProxy = true
+		}
+		if e == "NO_PROXY=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16" {
+			hasUpperNoProxy = true
+		}
+	}
+	if !hasNoProxy || !hasUpperNoProxy {
+		t.Fatalf("expected both no_proxy and NO_PROXY in env: %v", env)
+	}
+}
+
+

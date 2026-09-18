@@ -14,6 +14,7 @@ import (
 	ciliumebpf "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
+	"github.com/qtopie/vproxy/proxy/tproxy"
 	"golang.org/x/sys/unix"
 )
 
@@ -244,9 +245,20 @@ type LPMCIDRKey struct {
 
 // OriginalDst mirrors struct original_dst in redirect.c.
 type OriginalDst struct {
-	IP     [16]byte  // IPv4: IP[0-3] in network byte order; IPv6: all 16 bytes
-	Port   uint32    // network byte order
-	Family uint32    // AF_INET or AF_INET6
+	IP     [16]byte // IPv4: IP[0-3] in network byte order; IPv6: all 16 bytes
+	Port   uint32   // network byte order
+	Family uint32   // AF_INET or AF_INET6
+	Pid    uint32   // caller TGID/PID
+	Comm   [16]byte // task command name
+}
+
+// ProcessName returns the trimmed process name string.
+func (d *OriginalDst) ProcessName() string {
+	end := 0
+	for end < len(d.Comm) && d.Comm[end] != 0 {
+		end++
+	}
+	return string(d.Comm[:end])
 }
 
 // ToTCPAddr converts an OriginalDst to a *net.TCPAddr.
@@ -309,6 +321,11 @@ func LookupTCPOrigDst(m *ciliumebpf.Map, conn net.Conn) (*net.TCPAddr, error) {
 		return nil, fmt.Errorf("tcp_orig_dst lookup (sport=%d dport=%d): %w",
 			key.ClientPort, key.ProxyPort, err)
 	}
+
+	if dst.Pid > 0 {
+		tproxy.RecordProcessMetadata(int(key.ClientPort), int(dst.Pid), dst.ProcessName())
+	}
+
 	return dst.ToTCPAddr(), nil
 }
 
@@ -332,6 +349,11 @@ func LookupUDPOrigDst(m *ciliumebpf.Map, srcAddr *net.UDPAddr) (*net.UDPAddr, er
 		return nil, fmt.Errorf("udp_orig_dst lookup (sport=%d family=%d): %w",
 			key.SrcPort, family, err)
 	}
+
+	if dst.Pid > 0 {
+		tproxy.RecordProcessMetadata(int(key.SrcPort), int(dst.Pid), dst.ProcessName())
+	}
+
 	return dst.ToUDPAddr(), nil
 }
 

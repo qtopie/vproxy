@@ -191,14 +191,10 @@ func StartDarwinTransparent(ctx context.Context, httpPort, socksPort, webPort in
 				return
 			}
 			log.Printf("[PF] Received DNS query from %v (%d bytes)", remoteAddr, n)
-			resp, domain, err := dns.HandleDNSQuery(buf[:n])
-			if err != nil {
-				log.Printf("[PF] DNS Handle error for %s: %v", domain, err)
-				// Forward to real DNS? For now just skip
-				continue
+			if resp, domain, handled := dns.HijackPacket(buf[:n]); handled {
+				log.Printf("[PF] DNS Hijacked: %s -> Fake-IP", domain)
+				udpConn.WriteTo(resp, remoteAddr)
 			}
-			log.Printf("[PF] DNS Hijacked: %s -> Fake-IP", domain)
-			udpConn.WriteTo(resp, remoteAddr)
 		}
 	}()
 

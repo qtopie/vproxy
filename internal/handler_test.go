@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/qtopie/vproxy/internal/dns"
 	"github.com/qtopie/vproxy/internal/mitm"
 )
 
@@ -255,4 +257,83 @@ func TestProxyHandler_EndToEndRewrite(t *testing.T) {
 		t.Fatalf("nil backendURL")
 	}
 }
+
+// TestFakeIP_DomainRestorationAndRuleMatching validates SPEC-FAKEIP-LINUX-004 and SPEC-FAKEIP-LINUX-005.
+func TestFakeIP_DomainRestorationAndRuleMatching(t *testing.T) {
+	_ = dns.InitGlobalPool("198.18.0.0/15")
+
+	fakeGoogleIP := dns.GlobalPool.GetIP("api.google.com")
+	fakeBingIP := dns.GlobalPool.GetIP("cn.bing.com")
+
+	rm := NewRuleManager([]string{
+		"FINAL,DIRECT",
+		"google.com,PROXY",
+		"cn.bing.com,DIRECT",
+	})
+
+	// 1. Bare IP without Fake-IP restoration falls through to FINAL,DIRECT
+	action, _ := rm.MatchContext(MatchContext{Host: fakeGoogleIP.String()})
+	if action != ActionDirect {
+		t.Fatalf("expected bare IP to fall through to DIRECT, got %v", action)
+	}
+
+	// 2. With Fake-IP restoration, the domain is recovered and matches google.com,PROXY
+	restoredHost := fakeGoogleIP.String()
+	ip := net.ParseIP(restoredHost)
+	if ip != nil && dns.GlobalPool.IsFakeIP(ip) {
+		restoredHost = dns.GlobalPool.GetDomain(ip)
+	}
+	if restoredHost != "api.google.com" {
+		t.Fatalf("expected api.google.com, got %s", restoredHost)
+	}
+
+	action, _ = rm.MatchContext(MatchContext{Host: restoredHost})
+	if action != ActionProxy {
+		t.Fatalf("expected restored domain to match PROXY, got %v", action)
+	}
+
+	// 3. For DIRECT domain, Fake-IP correctly recovers cn.bing.com and matches ActionDirect
+	restoredBingHost := fakeBingIP.String()
+	bingIP := net.ParseIP(restoredBingHost)
+	if bingIP != nil && dns.GlobalPool.IsFakeIP(bingIP) {
+		restoredBingHost = dns.GlobalPool.GetDomain(bingIP)
+	}
+	actionBing, _ := rm.MatchContext(MatchContext{Host: restoredBingHost})
+	if actionBing != ActionDirect {
+		t.Fatalf("expected restored bing domain to match DIRECT, got %v", actionBing)
+	}
+}
+
+// TestProcessInspector_RuleMatching validates SPEC-LINUX-PROC-005.
+func TestProcessInspector_RuleMatching(t *testing.T) {
+	rm := NewRuleManager([]string{
+		"FINAL,DIRECT",
+		"PROCESS,curl,PROXY",
+		"PROCESS,code-server,PROXY",
+		"PROCESS,mytool,DIRECT",
+	})
+
+	// 1. Context without process metadata falls through to FINAL,DIRECT
+	action, _ := rm.MatchContext(MatchContext{Host: "1.2.3.4"})
+	if action != ActionDirect {
+		t.Fatalf("expected DIRECT for context without process, got %v", action)
+	}
+
+	// 2. Context with Process="curl" matches PROCESS,curl,PROXY
+	action, rule := rm.MatchContext(MatchContext{Host: "1.2.3.4", Process: "curl", PID: 1234})
+	if action != ActionProxy {
+		t.Fatalf("expected PROXY for curl, got %v", action)
+	}
+	if rule == nil || rule.Target != "curl" {
+		t.Fatalf("unexpected matched rule: %v", rule)
+	}
+
+	// 3. Context with Process="mytool" matches PROCESS,mytool,DIRECT
+	action, _ = rm.MatchContext(MatchContext{Host: "1.2.3.4", Process: "mytool", PID: 5678})
+	if action != ActionDirect {
+		t.Fatalf("expected DIRECT for mytool, got %v", action)
+	}
+}
+
+
 
