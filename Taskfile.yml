@@ -1,18 +1,29 @@
 version: '3'
 
 vars:
-  BINARY_NAME: vproxy
+  EXE: '{{if eq OS "windows"}}.exe{{else}}{{end}}'
+  BINARY_NAME: 'vproxy{{.EXE}}'
 
 tasks:
   default:
     desc: Build the vproxy binary
     cmds:
+      - task: build
+
+  build:
+    desc: Build the vproxy binary (bin/vproxy or bin/vproxy.exe on Windows)
+    cmds:
       - go build -o bin/{{.BINARY_NAME}} ./cmd/vproxy
+
+  build-windows:
+    desc: Build the Windows amd64 binary (bin/vproxy.exe)
+    cmds:
+      - '{{if eq OS "windows"}}go build -o bin/vproxy.exe ./cmd/vproxy{{else}}GOOS=windows GOARCH=amd64 go build -o bin/vproxy.exe ./cmd/vproxy{{end}}'
 
   clean:
     desc: Clean up build artifacts
     cmds:
-      - rm -rf bin/{{.BINARY_NAME}} bin/test_*
+      - rm -rf bin/{{.BINARY_NAME}} bin/vproxy bin/vproxy.exe bin/test_*
 
   build-tests:
     desc: Build all test binaries

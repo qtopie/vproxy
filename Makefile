@@ -3,8 +3,11 @@ NAME=vproxy
 all:
 	go build -o bin/vproxy ./cmd/vproxy
 
+build-windows:
+	GOOS=windows GOARCH=amd64 go build -o bin/vproxy.exe ./cmd/vproxy
+
 clean:
-	rm -rf bin/vproxy bin/test_*
+	rm -rf bin/vproxy bin/vproxy.exe bin/test_*
 
 build-tests:
 	go build -o bin/test_direct ./tests/direct
