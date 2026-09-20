@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +16,7 @@ import (
 // ServerManager holds a list of servers, periodically tests them, and provides the best one.
 type ServerManager struct {
 	servers      []string
+	selfPorts    []int
 	activeServer string
 	lastSuccess  time.Time
 	mu           sync.RWMutex
@@ -158,6 +160,56 @@ func (sm *ServerManager) ReportSuccess(addr string) {
 	sm.mu.Unlock()
 }
 
+// SetSelfPorts sets the local ports listened by vproxy to prevent self-loop.
+func (sm *ServerManager) SetSelfPorts(ports []int) {
+	if sm == nil {
+		return
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.selfPorts = ports
+}
+
+// IsSelfUpstream checks if an upstream address points to vproxy itself.
+func (sm *ServerManager) IsSelfUpstream(addr string) bool {
+	if sm == nil {
+		return false
+	}
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if len(sm.selfPorts) == 0 {
+		return false
+	}
+	u, err := url.Parse(addr)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	ip := net.ParseIP(host)
+	isLoopback := host == "localhost" || (ip != nil && ip.IsLoopback())
+	if !isLoopback {
+		return false
+	}
+	portStr := u.Port()
+	if portStr == "" {
+		switch u.Scheme {
+		case "http":
+			portStr = "80"
+		case "socks5":
+			portStr = "1080"
+		case "tproxy":
+			portStr = "10080"
+		}
+	}
+	port, _ := strconv.Atoi(portStr)
+	for _, sp := range sm.selfPorts {
+		if sp > 0 && sp == port {
+			return true
+		}
+	}
+	return false
+}
+
 // testServers performs a simple TCP port check on servers in order.
 func (sm *ServerManager) testServers() {
 	sm.mu.RLock()
@@ -180,6 +232,10 @@ func (sm *ServerManager) testServers() {
 	}
 
 	for _, addr := range servers {
+		if sm.IsSelfUpstream(addr) {
+			log.Printf("ServerManager: Upstream %s points to self listening port, skipping to prevent loop", addr)
+			continue
+		}
 		dialAddr := addr
 		scheme := ""
 		if u, err := url.Parse(addr); err == nil && u.Host != "" {

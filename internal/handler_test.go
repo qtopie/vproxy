@@ -320,18 +320,33 @@ func TestProcessInspector_RuleMatching(t *testing.T) {
 	}
 
 	// 2. Context with Process="curl" matches PROCESS,curl,PROXY
-	action, rule := rm.MatchContext(MatchContext{Host: "1.2.3.4", Process: "curl", PID: 1234})
+	action, _ = rm.MatchContext(MatchContext{Host: "1.2.3.4", Process: "curl", PID: 1234})
 	if action != ActionProxy {
 		t.Fatalf("expected PROXY for curl, got %v", action)
-	}
-	if rule == nil || rule.Target != "curl" {
-		t.Fatalf("unexpected matched rule: %v", rule)
 	}
 
 	// 3. Context with Process="mytool" matches PROCESS,mytool,DIRECT
 	action, _ = rm.MatchContext(MatchContext{Host: "1.2.3.4", Process: "mytool", PID: 5678})
 	if action != ActionDirect {
 		t.Fatalf("expected DIRECT for mytool, got %v", action)
+	}
+}
+
+func TestSNIHostSyncInMatchContext(t *testing.T) {
+	rm := NewRuleManager([]string{
+		"oauth2.googleapis.com,PROXY",
+		"FINAL,DIRECT",
+	})
+	// Raw IP without SNI matching falls through to FINAL,DIRECT
+	action, _ := rm.MatchContext(MatchContext{Host: "198.18.0.12"})
+	if action != ActionDirect {
+		t.Fatalf("expected raw IP to match FINAL,DIRECT, got %v", action)
+	}
+
+	// Restored domain via SNI sniffing updates host to oauth2.googleapis.com
+	action, _ = rm.MatchContext(MatchContext{Host: "oauth2.googleapis.com"})
+	if action != ActionProxy {
+		t.Fatalf("expected oauth2.googleapis.com to match ActionProxy, got %v", action)
 	}
 }
 

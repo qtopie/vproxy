@@ -18,7 +18,9 @@ def qemu_agent(cmd_dict, vm=None):
         raise RuntimeError(f"virsh error: {p.stderr.strip()}")
     return json.loads(p.stdout)
 
-def run_powershell(ps_command, timeout=30):
+def run_powershell(ps_command, timeout=None):
+    if timeout is None:
+        timeout = int(os.environ.get("TIMEOUT", "120"))
     # Encode command to avoid escape issues: powershell -EncodedCommand
     encoded = base64.b64encode(ps_command.encode('utf-16le')).decode('ascii')
     payload = {

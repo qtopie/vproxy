@@ -10,10 +10,12 @@ import (
 )
 
 type Config struct {
-	Upstreams    []string `json:"upstreams"`
-	Rules        []string `json:"rules"`
-	TestInterval int      `json:"test_interval"` // seconds
+	Upstreams      []string `json:"upstreams"`
+	Rules          []string `json:"rules"`
+	TestInterval   int      `json:"test_interval"` // seconds
 	WebPort        int      `json:"web_port,omitempty"`
+	SocksPort      *int     `json:"socks_port,omitempty"`
+	HttpPort       *int     `json:"http_port,omitempty"`
 	EnableEbpf     *bool    `json:"enable_ebpf,omitempty"`
 	DirectDNS      *bool    `json:"direct_dns,omitempty"`
 	DialTimeoutMs  *int     `json:"dial_timeout_ms,omitempty"`

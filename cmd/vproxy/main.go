@@ -20,7 +20,7 @@ var (
 	configPath = flag.String("c", "vproxy.json", "path to config file")
 	verbose    = flag.Bool("v", false, "verbose mode")
 	localHTTP  = flag.Int("http", 8118, "local HTTP proxy port")
-	localSocks = flag.Int("socks", 1080, "local SOCKS5 proxy port")
+	localSocks = flag.Int("socks", 0, "local SOCKS5 proxy port (default: 0, disabled)")
 	localTrans = flag.Int("trans", 10080, "local transparent proxy port")
 	useTun     = flag.Bool("tun", false, "enable TUN mode (Linux only)")
 )
@@ -205,6 +205,12 @@ func startBackgroundServer(config, pidFile string) error {
 	}
 	if *verbose {
 		bgArgs = append(bgArgs, "-v")
+	}
+	if *localSocks > 0 {
+		bgArgs = append(bgArgs, "-socks", strconv.Itoa(*localSocks))
+	}
+	if *localHTTP != 8118 {
+		bgArgs = append(bgArgs, "-http", strconv.Itoa(*localHTTP))
 	}
 	bgArgs = append(bgArgs, "start")
 	readyFile := filepath.Join(os.TempDir(), fmt.Sprintf("vproxy-ready-%d", time.Now().UnixNano()))

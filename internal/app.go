@@ -491,22 +491,28 @@ func (a *App) RunWrapper(args []string) {
 		// Inject proxy environment variables so downstream child processes running under this tool also inherit proxy support
 		httpPort := a.LocalHTTP
 		socksPort := a.LocalSocks
-		if httpPort == 0 {
-			httpPort = 8118
+		if httpPort > 0 {
+			httpProxy := fmt.Sprintf("http://127.0.0.1:%d", httpPort)
+			env = append(env,
+				fmt.Sprintf("http_proxy=%s", httpProxy),
+				fmt.Sprintf("https_proxy=%s", httpProxy),
+				fmt.Sprintf("HTTP_PROXY=%s", httpProxy),
+				fmt.Sprintf("HTTPS_PROXY=%s", httpProxy),
+			)
 		}
-		if socksPort == 0 {
-			socksPort = 1080
+		if socksPort > 0 {
+			socksProxy := fmt.Sprintf("socks5://127.0.0.1:%d", socksPort)
+			env = append(env,
+				fmt.Sprintf("all_proxy=%s", socksProxy),
+				fmt.Sprintf("ALL_PROXY=%s", socksProxy),
+			)
+		} else if httpPort > 0 {
+			httpProxy := fmt.Sprintf("http://127.0.0.1:%d", httpPort)
+			env = append(env,
+				fmt.Sprintf("all_proxy=%s", httpProxy),
+				fmt.Sprintf("ALL_PROXY=%s", httpProxy),
+			)
 		}
-		httpProxy := fmt.Sprintf("http://127.0.0.1:%d", httpPort)
-		socksProxy := fmt.Sprintf("socks5://127.0.0.1:%d", socksPort)
-		env = append(env,
-			fmt.Sprintf("http_proxy=%s", httpProxy),
-			fmt.Sprintf("https_proxy=%s", httpProxy),
-			fmt.Sprintf("all_proxy=%s", socksProxy),
-			fmt.Sprintf("HTTP_PROXY=%s", httpProxy),
-			fmt.Sprintf("HTTPS_PROXY=%s", httpProxy),
-			fmt.Sprintf("ALL_PROXY=%s", socksProxy),
-		)
 		env = a.appendNoProxyEnv(env)
 
 		cmd := exec.Command(cmdName, cmdArgs...)
@@ -648,10 +654,32 @@ func (a *App) appendNoProxyEnv(env []string) []string {
 }
 
 func (a *App) setupServices() (*ServerManager, *ProxyHandler) {
+	if a.Config.SocksPort != nil && a.LocalSocks == 0 {
+		a.LocalSocks = *a.Config.SocksPort
+	}
+	if a.Config.HttpPort != nil && a.LocalHTTP == 8118 {
+		a.LocalHTTP = *a.Config.HttpPort
+	}
+
 	sm := NewServerManager(a.Config.Upstreams, time.Duration(a.Config.TestInterval)*time.Second, 5*time.Second)
 	if sm == nil {
 		Fatal("No upstream servers configured")
 	}
+
+	var selfPorts []int
+	if a.LocalSocks > 0 {
+		selfPorts = append(selfPorts, a.LocalSocks)
+	}
+	if a.LocalHTTP > 0 {
+		selfPorts = append(selfPorts, a.LocalHTTP)
+	}
+	if a.LocalTrans > 0 {
+		selfPorts = append(selfPorts, a.LocalTrans)
+	}
+	if a.Config.WebPort > 0 {
+		selfPorts = append(selfPorts, a.Config.WebPort)
+	}
+	sm.SetSelfPorts(selfPorts)
 
 	rm := NewRuleManager(a.Config.Rules)
 	if a.Config.DirectDNS != nil {

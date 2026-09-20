@@ -296,6 +296,9 @@ func (ph *ProxyHandler) StartSocks() error {
 	if ph.socksLn != nil {
 		return nil
 	}
+	if ph.SocksPort <= 0 {
+		return nil
+	}
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", ph.SocksPort))
 	if err != nil {
 		ln, err = net.Listen("tcp", "127.0.0.1:0")
@@ -311,6 +314,9 @@ func (ph *ProxyHandler) StartSocks() error {
 
 func (ph *ProxyHandler) StartHTTP() error {
 	if ph.httpLn != nil {
+		return nil
+	}
+	if ph.HttpPort < 0 {
 		return nil
 	}
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", ph.HttpPort))
@@ -1129,8 +1135,13 @@ func (ph *ProxyHandler) dialTarget(target string, process string, pid int) (net.
 		upstreamURL := ph.sm.GetBestServer()
 		if upstreamURL == "" {
 			servers := ph.sm.GetServers()
-			if len(servers) > 0 {
-				upstreamURL = servers[0]
+			for _, s := range servers {
+				if !ph.sm.IsSelfUpstream(s) {
+					upstreamURL = s
+					break
+				}
+			}
+			if upstreamURL != "" {
 				Debugf("[Dial] No verified upstream, falling back to first configured: %s (attempt %d/%d)", upstreamURL, attempt, retryCount)
 			} else {
 				return nil, fmt.Errorf("no upstream servers configured")
@@ -1273,6 +1284,7 @@ func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 		peekingConn := conn.(*PeekingConn)
 		if domain, err := sniffSNI(peekingConn); err == nil && domain != "" {
 			target = net.JoinHostPort(domain, port)
+			host = domain
 			log.Printf("[TUN] Restored domain via SNI sniffing %s -> %s", host, domain)
 		}
 	}

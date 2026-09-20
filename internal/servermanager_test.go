@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -76,5 +77,25 @@ func TestServerManager_TProxy(t *testing.T) {
 	best := sm.GetBestServer()
 	if best != tproxyURL {
 		t.Errorf("Expected active server to be %s, got %s", tproxyURL, best)
+	}
+}
+
+func TestUpstreamSelfLoopDetection(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	port := ln.Addr().(*net.TCPAddr).Port
+	selfUpstream := fmt.Sprintf("socks5://127.0.0.1:%d", port)
+
+	sm := NewServerManager([]string{selfUpstream}, 1*time.Minute, 1*time.Second)
+	sm.SetSelfPorts([]int{port})
+	sm.testServers()
+
+	best := sm.GetBestServer()
+	if best == selfUpstream {
+		t.Fatalf("expected self-loop upstream %s to be rejected, but got active: %s", selfUpstream, best)
 	}
 }

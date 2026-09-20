@@ -133,4 +133,57 @@ func TestApp_AppendNoProxyEnv(t *testing.T) {
 	}
 }
 
+func TestSocksDefaultDisabled(t *testing.T) {
+	sm := NewServerManager([]string{}, 1*time.Minute, 1*time.Second)
+	rm := NewRuleManager([]string{"DEFAULT,PROXY"})
+	// SocksPort <= 0 means disabled
+	ph := NewProxyHandler(sm, rm, 0, 0, 0, 0)
+	if err := ph.StartSocks(); err != nil {
+		t.Fatalf("StartSocks with port 0 should succeed without error: %v", err)
+	}
+	if ph.socksLn != nil {
+		t.Fatalf("expected ph.socksLn to be nil when SocksPort is 0")
+	}
+}
+
+func TestSocksExplicitPort(t *testing.T) {
+	sm := NewServerManager([]string{}, 1*time.Minute, 1*time.Second)
+	rm := NewRuleManager([]string{"DEFAULT,PROXY"})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to find free port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	ph := NewProxyHandler(sm, rm, port, 0, 0, 0)
+	if err := ph.StartSocks(); err != nil {
+		t.Fatalf("StartSocks with explicit port failed: %v", err)
+	}
+	defer ph.Stop()
+	if ph.socksLn == nil {
+		t.Fatalf("expected ph.socksLn to be non-nil when SocksPort > 0")
+	}
+	if ph.SocksPort != port {
+		t.Fatalf("expected ph.SocksPort to be %d, got %d", port, ph.SocksPort)
+	}
+}
+
+func TestConfig_SocksHttpPortJSON(t *testing.T) {
+	cfgJSON := `{
+		"socks_port": 10808,
+		"http_port": 8118
+	}`
+	var cfg Config
+	if err := json.Unmarshal([]byte(cfgJSON), &cfg); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	if cfg.SocksPort == nil || *cfg.SocksPort != 10808 {
+		t.Fatalf("expected SocksPort 10808, got %v", cfg.SocksPort)
+	}
+	if cfg.HttpPort == nil || *cfg.HttpPort != 8118 {
+		t.Fatalf("expected HttpPort 8118, got %v", cfg.HttpPort)
+	}
+}
+
 
