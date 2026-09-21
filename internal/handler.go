@@ -308,7 +308,7 @@ func (ph *ProxyHandler) StartSocks() error {
 	}
 	ph.socksLn = ln
 	ph.SocksPort = ln.Addr().(*net.TCPAddr).Port
-	go ph.serveSocks()
+	go ph.serveSocks(ln)
 	return nil
 }
 
@@ -328,7 +328,7 @@ func (ph *ProxyHandler) StartHTTP() error {
 	}
 	ph.httpLn = ln
 	ph.HttpPort = ln.Addr().(*net.TCPAddr).Port
-	go ph.serveHTTP()
+	go ph.serveHTTP(ln)
 	return nil
 }
 
@@ -390,14 +390,14 @@ func (ph *ProxyHandler) StartTransparent() error {
 	ph.transLn = ln
 	ph.TransPort = ln.Addr().(*net.TCPAddr).Port
 	Infof("Transparent TCP proxy listening on %d (mode: redirect)", ph.TransPort)
-	go ph.serveTransparent()
+	go ph.serveTransparent(ln)
 
 	udpLn, err := tproxy.ListenUDPTransparent(ph.TransPort)
 	if err != nil {
 		log.Printf("Failed to listen transparent UDP on %d: %v", ph.TransPort, err)
 	} else {
 		ph.transUDPLn = udpLn
-		go ph.serveTransparentUDP()
+		go ph.serveTransparentUDP(udpLn)
 	}
 
 	return nil
@@ -490,9 +490,12 @@ func (ph *ProxyHandler) Stop() {
 	}
 }
 
-func (ph *ProxyHandler) serveSocks() {
+func (ph *ProxyHandler) serveSocks(ln net.Listener) {
+	if ln == nil {
+		return
+	}
 	for {
-		conn, err := ph.socksLn.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
@@ -532,9 +535,12 @@ func (ph *ProxyHandler) serveSocks() {
 	}
 }
 
-func (ph *ProxyHandler) serveTransparent() {
+func (ph *ProxyHandler) serveTransparent(ln net.Listener) {
+	if ln == nil {
+		return
+	}
 	for {
-		conn, err := ph.transLn.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
@@ -567,11 +573,14 @@ func (ph *ProxyHandler) serveTransparent() {
 	}
 }
 
-func (ph *ProxyHandler) serveTransparentUDP() {
+func (ph *ProxyHandler) serveTransparentUDP(ln *net.UDPConn) {
+	if ln == nil {
+		return
+	}
 	buf := make([]byte, 65535)
 	oob := make([]byte, 1024)
 	for {
-		n, src, dst, err := tproxy.ReadFromUDPWithOrigDst(ph.transUDPLn, buf, oob)
+		n, src, dst, err := tproxy.ReadFromUDPWithOrigDst(ln, buf, oob)
 		if err != nil {
 			return
 		}
@@ -660,9 +669,12 @@ func (c *peekedConn) Read(p []byte) (n int, err error) {
 
 var traceCounter uint64
 
-func (ph *ProxyHandler) serveHTTP() {
+func (ph *ProxyHandler) serveHTTP(ln net.Listener) {
+	if ln == nil {
+		return
+	}
 	for {
-		conn, err := ph.httpLn.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
