@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/qtopie/vproxy/internal/dns"
@@ -37,14 +38,23 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
+type ifCacheEntry struct {
+	ifIndex   int
+	expiresAt time.Time
+}
+
 var (
 	winPhysicalIfIdx int
-	winTunDevice tun.Device
-	winTunLUID   winipcfg.LUID
-	winTunDNS    []netip.Addr
+	winTunIfIdx      int
+	winTunDevice     tun.Device
+	winTunLUID       winipcfg.LUID
+	winTunDNS        []netip.Addr
 	winTunBypassRoutes []winBypassRoute
-	winIPStack   *stack.Stack
-	winMu        sync.Mutex
+	winIPStack       *stack.Stack
+	winMu            sync.Mutex
+
+	bestIfCache sync.Map
+	ifCacheTTL  = 5 * time.Second
 
 	// iphlpapi.dll — routing and TCP/UDP table queries
 	modIphlpapi             = windows.NewLazySystemDLL("iphlpapi.dll")
@@ -384,6 +394,11 @@ func setupRoutingWindowsLUID(luid winipcfg.LUID, upstreams []string, bypassNodes
 		_ = inetIf.Set()
 	}
 
+	winTunLUID = luid
+	if inetIf, err := luid.IPInterface(winipcfg.AddressFamily(windows.AF_INET)); err == nil {
+		winTunIfIdx = int(inetIf.InterfaceIndex)
+	}
+
 	// Two /1 routes have longer prefix than the default /0, capturing all traffic.
 	routes := []netip.Prefix{
 		netip.MustParsePrefix("0.0.0.0/1"),
@@ -412,27 +427,47 @@ func setupRoutingWindowsLUID(luid winipcfg.LUID, upstreams []string, bypassNodes
 	return nil
 }
 
+// findBestPhysicalRoute finds the best matching physical route for targetAddr using longest prefix match.
+func findBestPhysicalRoute(routes []winipcfg.MibIPforwardRow2, targetAddr netip.Addr, tunLUID winipcfg.LUID) *winipcfg.MibIPforwardRow2 {
+	var best *winipcfg.MibIPforwardRow2
+	var bestBits int = -1
+
+	for i := range routes {
+		row := &routes[i]
+		if tunLUID != 0 && row.InterfaceLUID == tunLUID {
+			continue
+		}
+		prefix := row.DestinationPrefix.Prefix()
+		if !prefix.IsValid() || !prefix.Contains(targetAddr) {
+			continue
+		}
+		bits := prefix.Bits()
+		if bits > bestBits {
+			best = row
+			bestBits = bits
+		} else if bits == bestBits && best != nil {
+			if row.Metric < best.Metric {
+				best = row
+			}
+		}
+	}
+	return best
+}
+
 func setupUpstreamBypassRoutes(tunLUID winipcfg.LUID, upstreams []string, bypassNodes []string) error {
 	routes, err := winipcfg.GetIPForwardTable2(windows.AF_INET)
 	if err != nil {
 		return fmt.Errorf("enumerate physical routes: %w", err)
 	}
-	var physical *winipcfg.MibIPforwardRow2
+	var defaultPhysical *winipcfg.MibIPforwardRow2
 	for i := range routes {
 		row := &routes[i]
 		if row.InterfaceLUID == tunLUID || row.DestinationPrefix.PrefixLength != 0 {
 			continue
 		}
-		if physical == nil || row.Metric < physical.Metric {
-			physical = row
+		if defaultPhysical == nil || row.Metric < defaultPhysical.Metric {
+			defaultPhysical = row
 		}
-	}
-	if physical == nil {
-		return nil
-	}
-	nextHop := physical.NextHop.Addr()
-	if !nextHop.IsValid() || !nextHop.Is4() {
-		return nil
 	}
 
 	seenPrefix := make(map[netip.Prefix]struct{})
@@ -440,13 +475,32 @@ func setupUpstreamBypassRoutes(tunLUID winipcfg.LUID, upstreams []string, bypass
 		if !prefix.IsValid() || !prefix.Addr().Is4() {
 			return nil
 		}
+		if prefix.Addr().IsLoopback() {
+			return nil
+		}
 		if _, ok := seenPrefix[prefix]; ok {
 			return nil
 		}
 		seenPrefix[prefix] = struct{}{}
+
+		bestRoute := findBestPhysicalRoute(routes, prefix.Addr(), tunLUID)
+		if bestRoute == nil {
+			bestRoute = defaultPhysical
+		}
+		if bestRoute == nil {
+			return nil
+		}
+
+		var nextHop netip.Addr
+		if bestRoute.NextHop.Addr().IsValid() && !bestRoute.NextHop.Addr().IsUnspecified() {
+			nextHop = bestRoute.NextHop.Addr()
+		} else {
+			nextHop = netip.IPv4Unspecified()
+		}
+
 		row := winipcfg.MibIPforwardRow2{}
 		row.Init()
-		row.InterfaceLUID = physical.InterfaceLUID
+		row.InterfaceLUID = bestRoute.InterfaceLUID
 		row.Metric = 1
 		if err := row.DestinationPrefix.SetPrefix(prefix); err != nil {
 			return fmt.Errorf("set bypass route %s: %w", prefix, err)
@@ -455,33 +509,13 @@ func setupUpstreamBypassRoutes(tunLUID winipcfg.LUID, upstreams []string, bypass
 			return fmt.Errorf("set bypass gateway %s: %w", nextHop, err)
 		}
 		if err := row.Create(); err != nil {
-			return fmt.Errorf("create bypass route %s: %w", prefix, err)
+			log.Printf("[TUN/W] Notice: bypass route %s on LUID %v already present or failed: %v", prefix, bestRoute.InterfaceLUID, err)
+		} else {
+			winTunBypassRoutes = append(winTunBypassRoutes, winBypassRoute{
+				luid: bestRoute.InterfaceLUID, prefix: prefix, nextHop: nextHop,
+			})
 		}
-		winTunBypassRoutes = append(winTunBypassRoutes, winBypassRoute{
-			luid: physical.InterfaceLUID, prefix: prefix, nextHop: nextHop,
-		})
 		return nil
-	}
-
-	// Always bypass private/LAN ranges at the OS routing-table level so that
-	// traffic destined for local addresses never enters the TUN device.
-	// This mirrors the macOS pf `private_ips` table and prevents the upstream
-	// proxy (which lives on a private subnet) from being looped through itself.
-	privatePrefixes := []string{
-		"127.0.0.0/8",     // loopback
-		"10.0.0.0/8",     // RFC1918
-		"172.16.0.0/12",  // RFC1918
-		"192.168.0.0/16", // RFC1918
-		"169.254.0.0/16", // link-local
-	}
-	for _, p := range privatePrefixes {
-		prefix, err := netip.ParsePrefix(p)
-		if err != nil {
-			continue
-		}
-		if err := installPrefix(prefix); err != nil {
-			log.Printf("[TUN/W] Warning: could not install private bypass route %s: %v", p, err)
-		}
 	}
 
 	for _, upstream := range upstreams {
@@ -571,6 +605,8 @@ func cleanupWindowsState() {
 		}
 	}
 	winTunBypassRoutes = nil
+	winTunIfIdx = 0
+	bestIfCache = sync.Map{}
 
 	if winTunLUID != 0 {
 		if winTunDNS != nil {
@@ -621,6 +657,23 @@ func restoreDiscoveredTUNDNS() {
 	}
 }
 
+// isTunInterface checks whether an interface index corresponds to the Wintun adapter.
+func isTunInterface(ifIdx int) bool {
+	if ifIdx <= 0 {
+		return false
+	}
+	if winTunIfIdx > 0 && ifIdx == winTunIfIdx {
+		return true
+	}
+	if winTunLUID != 0 {
+		if inetIf, err := winTunLUID.IPInterface(winipcfg.AddressFamily(windows.AF_INET)); err == nil {
+			winTunIfIdx = int(inetIf.InterfaceIndex)
+			return ifIdx == winTunIfIdx
+		}
+	}
+	return false
+}
+
 // setsockoptInt calls ws2_32!setsockopt directly because Go's syscall package does
 // not expose SetsockoptInt on Windows.
 func setsockoptInt(fd uintptr, level, opt, value int) error {
@@ -669,22 +722,79 @@ func getDefaultInterfaceIndex() (int, error) {
 	return int(idx), nil
 }
 
-// GetDialerControl returns a DialContext control function that binds outgoing sockets
-// to the physical uplink interface via IP_UNICAST_IF, so vproxy's own connections
-// bypass the TUN and go directly to the network.
-func GetDialerControl() func(network, address string, c syscall.RawConn) error {
-	ifIdx, err := getDefaultInterfaceIndex()
-	if err != nil {
-		log.Printf("[TUN/W] GetDialerControl: %v", err)
-		return nil
+// getBestInterfaceForTarget determines the best physical egress interface index for a given IP.
+// It consults Windows iphlpapi!GetBestInterface, rejects TUN interface matches, and maintains a 5s TTL cache.
+func getBestInterfaceForTarget(targetIP net.IP) (int, error) {
+	if targetIP == nil {
+		return getDefaultInterfaceIndex()
 	}
+	ip4 := targetIP.To4()
+	if ip4 == nil {
+		return getDefaultInterfaceIndex()
+	}
+
+	key := string(ip4)
+	if val, ok := bestIfCache.Load(key); ok {
+		entry := val.(ifCacheEntry)
+		if time.Now().Before(entry.expiresAt) {
+			return entry.ifIndex, nil
+		}
+	}
+
+	var idx uint32
+	ret, _, err := procGetBestInterface.Call(
+		uintptr(*(*uint32)(unsafe.Pointer(&ip4[0]))),
+		uintptr(unsafe.Pointer(&idx)),
+	)
+	if ret != 0 || isTunInterface(int(idx)) || idx == 0 {
+		defaultIdx, defErr := getDefaultInterfaceIndex()
+		if defErr != nil {
+			if ret != 0 {
+				return 0, fmt.Errorf("GetBestInterface: %w", err)
+			}
+			return 0, defErr
+		}
+		bestIfCache.Store(key, ifCacheEntry{
+			ifIndex:   defaultIdx,
+			expiresAt: time.Now().Add(ifCacheTTL),
+		})
+		return defaultIdx, nil
+	}
+
+	resIdx := int(idx)
+	bestIfCache.Store(key, ifCacheEntry{
+		ifIndex:   resIdx,
+		expiresAt: time.Now().Add(ifCacheTTL),
+	})
+	return resIdx, nil
+}
+
+// GetDialerControl returns a DialContext control function that binds outgoing sockets
+// to the appropriate physical interface via IP_UNICAST_IF, dynamically resolved per target IP,
+// so vproxy's own connections bypass the TUN and reach upstreams and targets directly.
+func GetDialerControl() func(network, address string, c syscall.RawConn) error {
+	defaultIdx, _ := getDefaultInterfaceIndex()
 	return func(network, address string, c syscall.RawConn) error {
 		host, _, splitErr := net.SplitHostPort(address)
 		if splitErr == nil {
 			if isLoopbackAddress(host) {
 				return nil
 			}
+		} else {
+			host = address
 		}
+
+		targetIP := net.ParseIP(host)
+		ifIdx := defaultIdx
+		if targetIP != nil {
+			if bestIdx, err := getBestInterfaceForTarget(targetIP); err == nil && bestIdx > 0 {
+				ifIdx = bestIdx
+			}
+		}
+		if ifIdx <= 0 {
+			return nil
+		}
+
 		var opErr error
 		_ = c.Control(func(fd uintptr) {
 			// In Winsock, IP_UNICAST_IF for IPv4 takes an interface index in network byte order (htonl).

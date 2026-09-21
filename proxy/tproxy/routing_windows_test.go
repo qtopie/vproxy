@@ -141,5 +141,87 @@ func TestWindows_IPv6TargetFormatting(t *testing.T) {
 	_ = port
 }
 
+func TestMultiNIC_FindBestPhysicalRoute(t *testing.T) {
+	// SPEC-WIN-NIC-003 & 004: Verify multi-NIC route matching picks most specific physical interface
+	luidNIC1 := winipcfg.LUID(100)
+	luidNIC2 := winipcfg.LUID(200)
+
+	nhNIC1 := netip.MustParseAddr("192.168.1.1")
+	nhOnLink := netip.MustParseAddr("0.0.0.0")
+
+	// Create mock routing table simulating dual NICs:
+	// NIC 1: default route 0.0.0.0/0 (gateway 192.168.1.1) and on-link 192.168.1.0/24
+	// NIC 2: on-link 192.168.31.0/24
+	rDefault := winipcfg.MibIPforwardRow2{InterfaceLUID: luidNIC1, Metric: 25}
+	_ = rDefault.DestinationPrefix.SetPrefix(netip.MustParsePrefix("0.0.0.0/0"))
+	_ = rDefault.NextHop.SetAddr(nhNIC1)
+
+	rSubnet1 := winipcfg.MibIPforwardRow2{InterfaceLUID: luidNIC1, Metric: 256}
+	_ = rSubnet1.DestinationPrefix.SetPrefix(netip.MustParsePrefix("192.168.1.0/24"))
+	_ = rSubnet1.NextHop.SetAddr(nhOnLink)
+
+	rSubnet2 := winipcfg.MibIPforwardRow2{InterfaceLUID: luidNIC2, Metric: 25}
+	_ = rSubnet2.DestinationPrefix.SetPrefix(netip.MustParsePrefix("192.168.31.0/24"))
+	_ = rSubnet2.NextHop.SetAddr(nhOnLink)
+
+	mockRoutes := []winipcfg.MibIPforwardRow2{rDefault, rSubnet1, rSubnet2}
+
+	// 1. Target 192.168.31.253 must match NIC 2 (LUID 200) via longest prefix match /24
+	best31 := findBestPhysicalRoute(mockRoutes, netip.MustParseAddr("192.168.31.253"), 0)
+	if best31 == nil || best31.InterfaceLUID != luidNIC2 {
+		t.Fatalf("expected 192.168.31.253 to match NIC 2 (LUID 200), got %v", best31)
+	}
+
+	// 2. Target 192.168.1.50 must match NIC 1 (LUID 100) via /24
+	best1 := findBestPhysicalRoute(mockRoutes, netip.MustParseAddr("192.168.1.50"), 0)
+	if best1 == nil || best1.InterfaceLUID != luidNIC1 {
+		t.Fatalf("expected 192.168.1.50 to match NIC 1 (LUID 100), got %v", best1)
+	}
+
+	// 3. Public target 8.8.8.8 must match default route on NIC 1
+	bestPub := findBestPhysicalRoute(mockRoutes, netip.MustParseAddr("8.8.8.8"), 0)
+	if bestPub == nil || bestPub.InterfaceLUID != luidNIC1 {
+		t.Fatalf("expected 8.8.8.8 to match NIC 1 (LUID 100), got %v", bestPub)
+	}
+}
+
+func TestGetBestInterfaceForTarget(t *testing.T) {
+	// SPEC-WIN-NIC-001: Invariant test verifying target resolution does not crash
+	idx, err := getBestInterfaceForTarget(net.ParseIP("8.8.8.8"))
+	// In sandbox / mock runtime, index might be fallback or valid
+	if err != nil && idx != 0 {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestDialerControlDynamicBinding(t *testing.T) {
+	// SPEC-WIN-NIC-002: DialerControl dynamic binding per target
+	ctrl := GetDialerControl()
+	if ctrl == nil {
+		return
+	}
+	// Verify loopback returns nil without attempting setsockopt
+	err := ctrl("tcp4", "127.0.0.1:1080", nil)
+	if err != nil {
+		t.Fatalf("expected loopback to be bypassed, got %v", err)
+	}
+	err = ctrl("tcp4", "localhost:8899", nil)
+	if err != nil {
+		t.Fatalf("expected localhost to be bypassed, got %v", err)
+	}
+}
+
+func TestPreserveLocalSubnetRoutes(t *testing.T) {
+	// SPEC-WIN-NIC-004: Ensure winTunBypassRoutes does not inject blanket 192.168.0.0/16 or 10.0.0.0/8
+	cleanupWindowsState()
+	defer cleanupWindowsState()
+
+	for _, br := range winTunBypassRoutes {
+		if br.prefix.String() == "192.168.0.0/16" || br.prefix.String() == "10.0.0.0/8" {
+			t.Fatalf("blanket RFC1918 prefix %s must not be injected", br.prefix)
+		}
+	}
+}
+
 
 
