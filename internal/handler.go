@@ -161,6 +161,7 @@ type ProxyHandler struct {
 	transLn        net.Listener
 	transUDPLn     *net.UDPConn
 	udpSessions    sync.Map
+	udpDropLog     udpDropLog
 	ebpfResult     *ebpf.LoadResult
 	BypassNodes    []string
 	rewriteEngine  *RewriteEngine
@@ -576,6 +577,61 @@ func (ph *ProxyHandler) serveTransparent(ln net.Listener) {
 	}
 }
 
+// udpDropLog throttles transparent-UDP drop diagnostics so that a producer whose
+// datagrams cannot be attributed cannot flood the log.
+type udpDropLog struct {
+	last atomic.Int64 // unix nanoseconds of the last emitted diagnostic
+}
+
+// allow reports whether a diagnostic may be emitted now, keeping at most one
+// message per interval. Safe for concurrent use.
+func (l *udpDropLog) allow(now time.Time, interval time.Duration) bool {
+	for {
+		prev := l.last.Load()
+		if now.UnixNano()-prev < int64(interval) {
+			return false
+		}
+		if l.last.CompareAndSwap(prev, now.UnixNano()) {
+			return true
+		}
+	}
+}
+
+// resolveUDPTarget decides the real destination of a transparently intercepted UDP
+// datagram.
+//
+// In eBPF mode the cgroup hook fires on connect()/sendmsg() and stores the real
+// destination in udp_orig_dst, then rewrites the address to 127.0.0.1:TransPort.
+// When the map lookup succeeds (first datagram of a new send) we use that value.
+// When it misses (subsequent datagrams on an already-connected socket, e.g. QUIC
+// multiplexing multiple streams over one UDP socket) the cgroup hook does not fire
+// again, so the cmsg reports 127.0.0.1:TransPort — the rewritten address.
+// We fall back to cmsg in that case; isSelfProxyTarget() will detect and drop the
+// self-addressed datagram safely.
+//
+// In iptables TPROXY mode the kernel preserves the real destination in the cmsg, so
+// the cmsg value is always authoritative and the map path is not used.
+func resolveUDPTarget(ebpfMode bool, cmsgDst, ebpfDst *net.UDPAddr, lookupErr error) (*net.UDPAddr, bool) {
+	if ebpfMode && lookupErr == nil && ebpfDst != nil {
+		// Map hit: use the real destination recorded by the cgroup hook.
+		return ebpfDst, true
+	}
+	// Map miss (eBPF) or TPROXY mode: fall back to cmsg.
+	// In eBPF mode isSelfProxyTarget() will catch the 127.0.0.1:TransPort case.
+	if cmsgDst == nil {
+		return nil, false
+	}
+	return cmsgDst, true
+}
+
+// isSelfProxyTarget reports whether dst points back at vproxy's own transparent
+// listener, which would otherwise create a proxy-to-proxy self-loop.
+// Loopback destinations are bypassed by the redirect hooks, so a genuine target can
+// never be a loopback address on the transparent port.
+func (ph *ProxyHandler) isSelfProxyTarget(dst *net.UDPAddr) bool {
+	return dst != nil && dst.Port == ph.TransPort && dst.IP.IsLoopback()
+}
+
 func (ph *ProxyHandler) serveTransparentUDP(ln *net.UDPConn) {
 	if ln == nil {
 		return
@@ -587,13 +643,24 @@ func (ph *ProxyHandler) serveTransparentUDP(ln *net.UDPConn) {
 		if err != nil {
 			return
 		}
-		if ph.ebpfResult != nil && ph.ebpfResult.UDPOrigDst != nil {
-			if origDst, errLookup := ebpf.LookupUDPOrigDst(ph.ebpfResult.UDPOrigDst, src); errLookup == nil {
-				dst = origDst
-			}
+		ebpfMode := ph.ebpfResult != nil && ph.ebpfResult.UDPOrigDst != nil
+		var ebpfDst *net.UDPAddr
+		var lookupErr error
+		if ebpfMode {
+			ebpfDst, lookupErr = ebpf.LookupUDPOrigDst(ph.ebpfResult.UDPOrigDst, src)
 		}
-		if dst == nil {
-			continue // ignore packets without orig dst
+		dst, ok := resolveUDPTarget(ebpfMode, dst, ebpfDst, lookupErr)
+		if !ok {
+			if ph.udpDropLog.allow(time.Now(), 5*time.Second) {
+				Warnf("[UDP] Dropped datagram from %s: original destination unavailable (eBPF orig-dst lookup miss)", src.String())
+			}
+			continue
+		}
+		if ph.isSelfProxyTarget(dst) {
+			if ph.udpDropLog.allow(time.Now(), 5*time.Second) {
+				Warnf("[UDP] Dropped datagram from %s: resolved target %s is vproxy's own listener (loopback)", src.String(), dst.String())
+			}
+			continue
 		}
 
 		// Intercept DNS (port 53) and respond with Fake-IP via unified DNSHijacker
