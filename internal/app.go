@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/url"
@@ -138,6 +139,14 @@ func (a *App) RunServer() {
 	RegisterFormatter(mtf)
 	StartWebServer(a, mtf)
 
+	// 2. Setup OpenTelemetry Tracing (if configured)
+	otelShutdown, otelErr := InitOtelTracer(context.Background(), a.Config.Otel)
+	if otelErr != nil {
+		Errorf("Failed to initialize OpenTelemetry tracer: %v", otelErr)
+	} else if IsOtelActive() {
+		Infof("OpenTelemetry tracing enabled (endpoint: %s, protocol: %s)", a.Config.Otel.Endpoint, a.Config.Otel.Protocol)
+	}
+
 	if err := ph.StartSocks(); err != nil {
 		msg := fmt.Sprintf("Failed to start SOCKS5 proxy: %v", err)
 		Fatal(msg)
@@ -210,6 +219,11 @@ func (a *App) RunServer() {
 
 	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
 		tproxy.Cleanup()
+	}
+	if otelShutdown != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = otelShutdown(shutdownCtx)
+		cancel()
 	}
 	ph.Stop()
 	sm.Stop()
@@ -734,6 +748,14 @@ func (a *App) watchConfig(path string, ph *ProxyHandler) {
 					}
 				} else {
 					ph.SetRewriteEngine(nil)
+				}
+				// Dynamically reload OpenTelemetry tracing
+				if _, err := InitOtelTracer(context.Background(), cfg.Otel); err != nil {
+					Errorf("Dynamic reload of OpenTelemetry tracer failed: %v", err)
+				} else if IsOtelActive() {
+					Infof("OpenTelemetry tracing dynamically active (endpoint: %s)", cfg.Otel.Endpoint)
+				} else {
+					Debugf("OpenTelemetry tracing dynamically deactivated")
 				}
 				Debugf("Config reloaded")
 			}

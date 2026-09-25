@@ -18,11 +18,22 @@ type Config struct {
 	HttpPort       *int     `json:"http_port,omitempty"`
 	EnableEbpf     *bool    `json:"enable_ebpf,omitempty"`
 	DirectDNS      *bool    `json:"direct_dns,omitempty"`
-	DialTimeoutMs  *int     `json:"dial_timeout_ms,omitempty"`
-	DialRetryCount *int     `json:"dial_retry_count,omitempty"`
-	BypassNodes    []string `json:"bypass_nodes,omitempty"`
-	Rewrites       []string `json:"rewrites,omitempty"`
+	DialTimeoutMs  *int        `json:"dial_timeout_ms,omitempty"`
+	DialRetryCount *int        `json:"dial_retry_count,omitempty"`
+	BypassNodes    []string    `json:"bypass_nodes,omitempty"`
+	Rewrites       []string    `json:"rewrites,omitempty"`
+	Otel           *OtelConfig `json:"otel,omitempty"`
 }
+
+type OtelConfig struct {
+	Enabled     bool    `json:"enabled"`
+	Endpoint    string  `json:"endpoint,omitempty"`     // e.g. "localhost:4317"
+	Protocol    string  `json:"protocol,omitempty"`     // "grpc" (default) or "http"
+	Insecure    bool    `json:"insecure,omitempty"`     // default true
+	ServiceName string  `json:"service_name,omitempty"` // default "vproxy"
+	SampleRate  float64 `json:"sample_rate,omitempty"`  // default 1.0 (100%)
+}
+
 
 // LoadConfig loads the configuration from the given path, with fallbacks to global and local defaults.
 // It returns the loaded config and the actual path used.

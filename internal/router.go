@@ -20,6 +20,8 @@ const (
 	ActionIntercept
 	// ActionMap means the request should be mapped to a local file or another URL.
 	ActionMap
+	// ActionBlock means the connection should be silently rejected (SPEC-BLOCK-001).
+	ActionBlock
 )
 
 func (ra RuleAction) String() string {
@@ -32,6 +34,8 @@ func (ra RuleAction) String() string {
 		return "INTERCEPT"
 	case ActionMap:
 		return "MAP"
+	case ActionBlock:
+		return "BLOCK"
 	default:
 		return "DIRECT"
 	}
@@ -45,13 +49,16 @@ const (
 	RuleTypeProcess
 	RuleTypeURL
 	RuleTypePID
+	// RuleTypeIPCIDR matches raw-IP destinations against a CIDR range (SPEC-BLOCK-002).
+	RuleTypeIPCIDR
 )
 
 // Rule represents a single routing rule.
 type Rule struct {
 	Type    RuleType
 	Pattern string
-	PID     int // Used for RuleTypePID
+	PID     int        // Used for RuleTypePID
+	CIDR    *net.IPNet // Used for RuleTypeIPCIDR (SPEC-BLOCK-002)
 	Action  RuleAction
 	Target  string // Used for ActionMap (e.g., file:///path or http://url)
 }
@@ -94,6 +101,7 @@ func (rm *RuleManager) AddPIDRule(pid int, action RuleAction) {
 //   - "PROCESS,Telegram,DIRECT"
 //   - "INTERCEPT,example.com"
 //   - "MAP,https://example.com/js/main.js,file:///tmp/main.js"
+//   - "IP_CIDR,10.0.0.0/8,BLOCK"
 //   - "example.com,PROXY"                              (defaults to DOMAIN)
 //   - "DEFAULT,DIRECT"
 func NewRuleManager(ruleEntries []string) *RuleManager {
@@ -124,6 +132,28 @@ func NewRuleManager(ruleEntries []string) *RuleManager {
 			ruleType = RuleTypeDomain
 			pattern = strings.TrimSpace(parts[1])
 			actionStr = "INTERCEPT"
+		} else if p0 == "IP_CIDR" && len(parts) >= 3 {
+			// SPEC-BLOCK-003: parse IP_CIDR,<cidr>,<action>
+			cidrStr := strings.TrimSpace(parts[1])
+			actionStr = strings.ToUpper(strings.TrimSpace(parts[2]))
+			switch actionStr {
+			case "DIRECT":
+				action = ActionDirect
+			case "PROXY":
+				action = ActionProxy
+			case "BLOCK":
+				action = ActionBlock
+			default:
+				log.Printf("Router: Unknown action '%s' in rule '%s'. Skipping.", actionStr, entry)
+				continue
+			}
+			_, ipNet, err := net.ParseCIDR(cidrStr)
+			if err != nil {
+				log.Printf("Router: invalid CIDR %q in rule %q, skipping", cidrStr, entry)
+				continue
+			}
+			rm.rules = append(rm.rules, Rule{Type: RuleTypeIPCIDR, CIDR: ipNet, Action: action})
+			continue
 		} else if len(parts) == 3 {
 			pattern = strings.TrimSpace(parts[1])
 			actionStr = strings.ToUpper(strings.TrimSpace(parts[2]))
@@ -141,6 +171,8 @@ func NewRuleManager(ruleEntries []string) *RuleManager {
 			action = ActionIntercept
 		case "MAP":
 			action = ActionMap
+		case "BLOCK":
+			action = ActionBlock
 		default:
 			log.Printf("Router: Unknown action '%s' in rule '%s'. Skipping.", actionStr, entry)
 			continue
@@ -275,6 +307,14 @@ func (rm *RuleManager) doMatchContext(ctx MatchContext) (RuleAction, string) {
 				if strings.Contains(rule.Pattern, ctx.Host) {
 					return rule.Action, rule.Target
 				}
+			}
+		case RuleTypeIPCIDR:
+			// SPEC-BLOCK-004: match raw-IP ctx.Host against the configured CIDR.
+			if rule.CIDR == nil {
+				continue
+			}
+			if ip := net.ParseIP(ctx.Host); ip != nil && rule.CIDR.Contains(ip) {
+				return rule.Action, rule.Target
 			}
 		}
 	}

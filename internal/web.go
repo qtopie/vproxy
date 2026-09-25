@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -76,8 +77,11 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 			ph.UpdateRules(newCfg.Rules, newCfg.DirectDNS == nil || *newCfg.DirectDNS)
 			ph.UpdateServers(newCfg.Upstreams)
 		}
+		// Dynamically hot-reload OpenTelemetry tracing
+		_, _ = InitOtelTracer(context.Background(), newCfg.Otel)
 
 		w.Write([]byte("Config saved and applied"))
+
 		return
 	}
 

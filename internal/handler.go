@@ -28,6 +28,9 @@ import (
 	"github.com/qtopie/vproxy/proxy/ebpf"
 	"github.com/qtopie/vproxy/proxy/tproxy"
 	"github.com/qtopie/vproxy/socks"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // PeekingConn is a net.Conn that allows peeking into the initial bytes.
@@ -715,12 +718,31 @@ func (ph *ProxyHandler) serveHTTP(ln net.Listener) {
 						}
 					}
 				}
+				// SPEC-BLOCK-005 §4.5: Reject blocked plain HTTP requests with 403.
+				plainAction, _ := ph.rm.MatchContext(MatchContext{Host: hostOnly, Process: process, PID: pid})
+				if plainAction == ActionBlock {
+					log.Printf("[BLOCK] HTTP request rejected: %s -> %s (process: %s)", conn.RemoteAddr(), req.Host, process)
+					res := &http.Response{
+						StatusCode: http.StatusForbidden,
+						ProtoMajor: 1, ProtoMinor: 1,
+						Header: http.Header{"X-Block-Reason": []string{"policy"}, "Content-Length": []string{"0"}, "Connection": []string{"close"}},
+					}
+					res.Write(conn)
+					return
+				}
 				ph.forwardPlainHTTPRequest(conn, req, hostOnly, process, pid)
 				return
 			}
 
 			action, _ := ph.rm.MatchContext(MatchContext{Host: hostOnly, Process: process, PID: pid})
 			isRewriteHost := ph.rewriteEngine != nil && ph.rewriteEngine.IsInterceptHost(hostOnly)
+
+			// SPEC-BLOCK-005 §4.4: Reject blocked CONNECT with HTTP 403.
+			if action == ActionBlock {
+				log.Printf("[BLOCK] HTTP CONNECT rejected: %s -> %s (process: %s)", conn.RemoteAddr(), req.Host, process)
+				fmt.Fprintf(conn, "HTTP/1.1 403 Forbidden\r\nX-Block-Reason: policy\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+				return
+			}
 
 			// 2. HTTPS CONNECT Tunnel (MITM when explicitly intercepted, mapped, or in rewrite rules)
 			if action == ActionIntercept || action == ActionMap || isRewriteHost {
@@ -1130,6 +1152,11 @@ func (ph *ProxyHandler) dialTarget(target string, process string, pid int) (net.
 		Debugf("[Dial] Target %s matches DIRECT rule, dialing directly", target)
 		return ph.dialDirect(target)
 	}
+	// SPEC-BLOCK-005 §4.2: Reject blocked connections.
+	if action == ActionBlock {
+		log.Printf("[BLOCK] TCP dial rejected: %s (process: %s)", target, process)
+		return nil, fmt.Errorf("BLOCK: connection to %s rejected by policy", target)
+	}
 
 	retryCount := ph.DialRetryCount
 	if retryCount <= 0 {
@@ -1226,6 +1253,11 @@ func (ph *ProxyHandler) dialTargetUDP(target string, process string, pid int) (n
 		}
 		return d.Dial("udp", target)
 	}
+	// SPEC-BLOCK-005 §4.3: Reject blocked UDP connections.
+	if action == ActionBlock {
+		log.Printf("[BLOCK] UDP dial rejected: %s (process: %s)", target, process)
+		return nil, fmt.Errorf("BLOCK: UDP to %s rejected by policy", target)
+	}
 
 	var rc net.Conn
 	var lastErr error
@@ -1311,6 +1343,44 @@ func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 	ctx := context.WithValue(context.Background(), traceKey{}, traceID)
 	ctx = context.WithValue(ctx, startTimeKey{}, time.Now())
 
+	tracer := GetOtelTracer()
+	var sessionSpan trace.Span
+	if IsOtelActive() {
+		clientIP := ""
+		clientPort := 0
+		if remoteAddr := conn.RemoteAddr(); remoteAddr != nil {
+			if h, p, err := net.SplitHostPort(remoteAddr.String()); err == nil {
+				clientIP = h
+				clientPort, _ = strconv.Atoi(p)
+			} else {
+				clientIP = remoteAddr.String()
+			}
+		}
+
+		targetHost, targetPortStr, _ := net.SplitHostPort(target)
+		targetPort, _ := strconv.Atoi(targetPortStr)
+
+		attrs := []attribute.KeyValue{
+			attribute.String("net.transport", "tcp"),
+			attribute.String("client.address", clientIP),
+			attribute.Int("client.port", clientPort),
+			attribute.String("destination.address", targetHost),
+			attribute.Int("destination.port", targetPort),
+		}
+		if pid > 0 {
+			attrs = append(attrs, attribute.Int("process.pid", pid))
+		}
+		if process != "" {
+			attrs = append(attrs, attribute.String("process.executable.name", process))
+		}
+
+		ctx, sessionSpan = tracer.Start(ctx, "vproxy.session",
+			trace.WithSpanKind(trace.SpanKindServer),
+			trace.WithAttributes(attrs...),
+		)
+		defer sessionSpan.End()
+	}
+
 	if process != "" {
 		TraceInfof(ctx, "Accepted connection from %s (Process: %s, PID: %d) targeting %s", conn.RemoteAddr(), process, pid, target)
 	} else {
@@ -1321,14 +1391,45 @@ func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 	// For TUN/GVisor, target == LocalAddr is expected behavior, so we only check this for REDIRECT/eBPF modes.
 	if target == conn.LocalAddr().String() && !tproxy.IsTUNConn(conn) {
 		TraceErrorf(ctx, "Loop detected: target is the same as local address %s, dropping connection", target)
+		if sessionSpan != nil {
+			sessionSpan.SetStatus(codes.Error, "loop detected")
+		}
 		return
 	}
 
 	isRewriteHost := ph.rewriteEngine != nil && ph.rewriteEngine.IsInterceptHost(host)
 	isInterceptAction := false
+	var matchedRuleType, matchedRuleAction string
+	var forwardAction RuleAction
 	if ph.rm != nil {
-		action, _ := ph.rm.MatchContext(MatchContext{Host: host, Process: process, PID: pid})
+		action, targetRule := ph.rm.MatchContext(MatchContext{Host: host, Process: process, PID: pid})
+		forwardAction = action
 		isInterceptAction = (action == ActionIntercept || action == ActionMap)
+		matchedRuleAction = action.String()
+		matchedRuleType = targetRule
+	}
+
+	// SPEC-BLOCK-005 §4.1: Silently close blocked TUN/transparent connections.
+	if forwardAction == ActionBlock {
+		TraceInfof(ctx, "[BLOCK] Rejected connection from %s to %s (process: %s)", conn.RemoteAddr(), target, process)
+		if sessionSpan != nil {
+			sessionSpan.SetStatus(codes.Error, "blocked by policy")
+		}
+		conn.Close()
+		return
+	}
+
+
+	if IsOtelActive() && sessionSpan != nil {
+		_, routeSpan := tracer.Start(ctx, "vproxy.route",
+			trace.WithSpanKind(trace.SpanKindInternal),
+			trace.WithAttributes(
+				attribute.String("rule.type", matchedRuleType),
+				attribute.String("rule.action", matchedRuleAction),
+				attribute.String("dns.resolved_host", host),
+			),
+		)
+		routeSpan.End()
 	}
 
 	if port == "443" && (isRewriteHost || isInterceptAction) {
@@ -1353,6 +1454,10 @@ func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 		rc, err := ph.dialDirect(target)
 		if err != nil {
 			TraceErrorf(ctx, "Failed to connect directly to %s: %v", target, err)
+			if sessionSpan != nil {
+				sessionSpan.RecordError(err)
+				sessionSpan.SetStatus(codes.Error, err.Error())
+			}
 			return
 		}
 		defer rc.Close()
@@ -1361,19 +1466,73 @@ func (ph *ProxyHandler) forward(conn net.Conn, target string) {
 		return
 	}
 
+	var dialSpan trace.Span
+	if IsOtelActive() && sessionSpan != nil {
+		_, dialSpan = tracer.Start(ctx, "vproxy.upstream_dial",
+			trace.WithSpanKind(trace.SpanKindClient),
+			trace.WithAttributes(
+				attribute.String("upstream.target", target),
+			),
+		)
+	}
+
 	rc, err := ph.dialTarget(target, process, pid)
 	if err != nil {
+		if dialSpan != nil {
+			dialSpan.RecordError(err)
+			dialSpan.SetStatus(codes.Error, err.Error())
+			dialSpan.End()
+		}
+		if sessionSpan != nil {
+			sessionSpan.RecordError(err)
+			sessionSpan.SetStatus(codes.Error, err.Error())
+		}
 		TraceErrorf(ctx, "Failed to connect to target %s: %v", target, err)
 		return
+	}
+	if dialSpan != nil {
+		dialSpan.SetStatus(codes.Ok, "connected")
+		dialSpan.End()
 	}
 	defer rc.Close()
 
 	TraceInfof(ctx, "Successfully established tunnel to target %s", target)
-	err = Relay(ctx, rc, conn)
-	if err != nil {
-		TraceErrorf(ctx, "Tunnel closed with error: %v", err)
+
+	var relaySpan trace.Span
+	relayStartTime := time.Now()
+	if IsOtelActive() && sessionSpan != nil {
+		_, relaySpan = tracer.Start(ctx, "vproxy.relay",
+			trace.WithSpanKind(trace.SpanKindInternal),
+		)
+	}
+
+	bytesSent, bytesRcvd, relayErr := RelayWithStats(ctx, rc, conn)
+	if relaySpan != nil {
+		relaySpan.SetAttributes(
+			attribute.Int64("traffic.bytes_sent", bytesSent),
+			attribute.Int64("traffic.bytes_received", bytesRcvd),
+			attribute.Int64("duration_ms", time.Since(relayStartTime).Milliseconds()),
+		)
+		if relayErr != nil {
+			relaySpan.RecordError(relayErr)
+			relaySpan.SetStatus(codes.Error, relayErr.Error())
+		} else {
+			relaySpan.SetStatus(codes.Ok, "closed cleanly")
+		}
+		relaySpan.End()
+	}
+
+	if relayErr != nil {
+		TraceErrorf(ctx, "Tunnel closed with error: %v", relayErr)
+		if sessionSpan != nil {
+			sessionSpan.RecordError(relayErr)
+			sessionSpan.SetStatus(codes.Error, relayErr.Error())
+		}
 	} else {
 		TraceInfof(ctx, "Tunnel closed cleanly")
+		if sessionSpan != nil {
+			sessionSpan.SetStatus(codes.Ok, "session completed")
+		}
 	}
 }
 
