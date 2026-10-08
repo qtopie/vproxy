@@ -12,6 +12,8 @@ import (
 	vlink "github.com/qtopie/vproxy/internal"
 )
 
+func prepareDaemonCommand(cmd *exec.Cmd) {}
+
 func requireElevatedPrivileges(command string) {
 	if os.Geteuid() != 0 {
 		vlink.Fatalf("'%s' command requires root privileges", command)
@@ -36,6 +38,18 @@ func performPrivilegedInitSetup(binary string) {
 	exec.Command("chown", "-R", sudoUser, "/sys/fs/cgroup/vproxy").Run()
 }
 
+func isPIDAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return p.Signal(syscall.Signal(0)) == nil
+}
+
 func stopProcess(process *os.Process) error {
 	return process.Signal(syscall.SIGTERM)
 }
+

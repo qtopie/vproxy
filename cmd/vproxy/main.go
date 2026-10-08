@@ -56,8 +56,8 @@ func main() {
 		// 1. Check for background daemon via PID file
 		data, err := os.ReadFile(pidFile)
 		if err == nil {
-			pid, _ := strconv.Atoi(string(data))
-			if _, err := os.FindProcess(pid); err == nil {
+			pid, _ := strconv.Atoi(strings.TrimSpace(string(data)))
+			if pid > 0 && isPIDAlive(pid) {
 				fmt.Printf("  Background Daemon: Running (PID: %d)\n", pid)
 
 				// 2. Try to get detailed status via IPC (Linux only; Windows uses Wintun TUN mode without Unix socket IPC)
@@ -193,9 +193,14 @@ func printUsage() {
 
 func startBackgroundServer(config, pidFile string) error {
 	// Check if already running
-	if _, err := os.Stat(pidFile); err == nil {
-		fmt.Fprintln(os.Stderr, "vproxy is already running. Run 'vproxy clean' first if you want to restart.")
-		return nil
+	if data, err := os.ReadFile(pidFile); err == nil {
+		pid, _ := strconv.Atoi(strings.TrimSpace(string(data)))
+		if pid > 0 && isPIDAlive(pid) {
+			fmt.Fprintln(os.Stderr, "vproxy is already running. Run 'vproxy clean' first if you want to restart.")
+			return nil
+		}
+		// Stale PID file; clean it up
+		_ = os.Remove(pidFile)
 	}
 
 	binary, _ := os.Executable()
@@ -216,6 +221,7 @@ func startBackgroundServer(config, pidFile string) error {
 	readyFile := filepath.Join(os.TempDir(), fmt.Sprintf("vproxy-ready-%d", time.Now().UnixNano()))
 	_ = os.Remove(readyFile)
 	cmd := exec.Command(binary, bgArgs...)
+	prepareDaemonCommand(cmd)
 	// Inherit environment but set a marker
 	cmd.Env = append(os.Environ(), "VP_BACKGROUND=1", "VP_READY_FILE="+readyFile)
 
