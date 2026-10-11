@@ -5,6 +5,8 @@ frontend/dist/*
 test.sh
 config.json
 *.json
+!frontend/*.json
+!frontend/package-lock.json
 **/*.o
 proxy/ebpf/bpf_bpfel.go
 proxy/ebpf/tc_bpf_bpfel.go
