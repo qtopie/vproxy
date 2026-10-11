@@ -5,15 +5,61 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
+	"path"
+	"path/filepath"
+	"strings"
+
+	"github.com/qtopie/vproxy/frontend"
 )
 
 var (
 	webMemoryTrace *MemoryTraceFormatter
 	webConfigPath  string
 	webApp         *App
+	customDistDir  string
 )
+
+// SetFrontendDistDir overrides the default frontend dist search paths (for testing).
+func SetFrontendDistDir(dir string) {
+	customDistDir = dir
+}
+
+func findFrontendDistDir() string {
+	if customDistDir != "" {
+		if fi, err := os.Stat(customDistDir); err == nil && fi.IsDir() {
+			indexPath := filepath.Join(customDistDir, "index.html")
+			if _, err := os.Stat(indexPath); err == nil {
+				return customDistDir
+			}
+		}
+		return ""
+	}
+	candidates := []string{
+		"frontend/dist",
+		"./dist",
+		"/usr/local/share/vproxy/frontend/dist",
+		"/usr/local/share/vproxy/dist",
+	}
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		candidates = append(candidates, filepath.Join(exeDir, "frontend/dist"))
+		candidates = append(candidates, filepath.Join(exeDir, "dist"))
+		candidates = append(candidates, filepath.Join(filepath.Dir(exeDir), "share/vproxy/frontend/dist"))
+		candidates = append(candidates, filepath.Join(filepath.Dir(exeDir), "share/vproxy/dist"))
+	}
+	for _, c := range candidates {
+		if fi, err := os.Stat(c); err == nil && fi.IsDir() {
+			indexPath := filepath.Join(c, "index.html")
+			if _, err := os.Stat(indexPath); err == nil {
+				return c
+			}
+		}
+	}
+	return ""
+}
 
 // StartWebServer starts the management Web UI.
 func StartWebServer(app *App, mtf *MemoryTraceFormatter) {
@@ -88,7 +134,48 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Method not allowed", 405)
 }
 
+// embeddedDist is the frontend bundled into the binary (overridable in tests).
+var embeddedDist fs.FS = frontend.DistFS()
+
+func hasIndex(fsys fs.FS) bool {
+	fi, err := fs.Stat(fsys, "index.html")
+	return err == nil && !fi.IsDir()
+}
+
+// resolveFrontendFS picks the frontend source: explicit override dir, then the
+// embedded bundle, then an on-disk dist directory (development), else nil.
+func resolveFrontendFS() fs.FS {
+	if customDistDir != "" {
+		if dir := findFrontendDistDir(); dir != "" {
+			return os.DirFS(dir)
+		}
+		return nil
+	}
+	if embeddedDist != nil && hasIndex(embeddedDist) {
+		return embeddedDist
+	}
+	if dir := findFrontendDistDir(); dir != "" {
+		return os.DirFS(dir)
+	}
+	return nil
+}
+
 func handleIndex(w http.ResponseWriter, r *http.Request) {
+	if fsys := resolveFrontendFS(); fsys != nil {
+		// path.Clean on a rooted path neutralises ".." traversal.
+		rel := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
+		if rel != "" && fs.ValidPath(rel) {
+			if fi, err := fs.Stat(fsys, rel); err == nil && !fi.IsDir() {
+				http.ServeFileFS(w, r, fsys, rel)
+				return
+			}
+		}
+		// SPA Fallback: serve index.html for all non-asset routes
+		http.ServeFileFS(w, r, fsys, "index.html")
+		return
+	}
+
+	// Fallback to built-in minimal HTML
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return

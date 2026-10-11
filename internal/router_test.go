@@ -148,3 +148,50 @@ func TestMatchURL(t *testing.T) {
 		}
 	})
 }
+
+func TestNewRuleManager_InactiveRulesIgnored(t *testing.T) {
+	rules := []string{
+		"#DOMAIN,inactive1.com,PROXY",
+		"# DOMAIN,inactive2.com,INTERCEPT",
+		"//PROCESS,curl,PROXY",
+		"DISABLED,DOMAIN,inactive3.com,BLOCK",
+		"disabled,10.0.0.0/8,BLOCK",
+		"active.com,PROXY",
+		"FINAL,DIRECT",
+	}
+
+	rm := NewRuleManager(rules)
+	if len(rm.rules) != 1 {
+		t.Fatalf("Expected exactly 1 active rule parsed, got %d", len(rm.rules))
+	}
+	if rm.rules[0].Pattern != "active.com" || rm.rules[0].Action != ActionProxy {
+		t.Fatalf("Unexpected active rule parsed: %+v", rm.rules[0])
+	}
+}
+
+func TestRuleManager_InactiveRuleFallback(t *testing.T) {
+	rules := []string{
+		"#DOMAIN,google.com,PROXY",
+		"//DOMAIN,youtube.com,PROXY",
+		"DISABLED,DOMAIN,facebook.com,BLOCK",
+		"active.com,PROXY",
+		"FINAL,DIRECT",
+	}
+
+	rm := NewRuleManager(rules)
+
+	// Inactive rules must not match, falling through to FINAL,DIRECT
+	for _, host := range []string{"google.com", "youtube.com", "facebook.com"} {
+		action, _ := rm.Match(host)
+		if action != ActionDirect {
+			t.Errorf("Host %s with inactive rule should fall through to DIRECT, got %v", host, action)
+		}
+	}
+
+	// Active rule must match
+	action, _ := rm.Match("active.com")
+	if action != ActionProxy {
+		t.Errorf("Host active.com should match PROXY, got %v", action)
+	}
+}
+

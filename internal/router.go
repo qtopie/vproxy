@@ -112,7 +112,13 @@ func NewRuleManager(ruleEntries []string) *RuleManager {
 	rm.defaultAction = ActionProxy
 
 	for _, entry := range ruleEntries {
-		parts := strings.Split(entry, ",")
+		trimmed := strings.TrimSpace(entry)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(strings.ToUpper(trimmed), "DISABLED,") {
+			// Inactive or comment rule (SPEC-INACTIVE-001)
+			continue
+		}
+
+		parts := strings.Split(trimmed, ",")
 		if len(parts) < 2 {
 			log.Printf("Router: Invalid rule format: %s. Skipping.", entry)
 			continue

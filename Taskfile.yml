@@ -1,6 +1,7 @@
 version: '3'
 
 vars:
+  LDFLAGS: '-s -w'
   EXE: '{{if eq OS "windows"}}.exe{{else}}{{end}}'
   BINARY_NAME: 'vproxy{{.EXE}}'
 
@@ -10,20 +11,39 @@ tasks:
     cmds:
       - task: build
 
-  build:
-    desc: Build the vproxy binary (bin/vproxy or bin/vproxy.exe on Windows)
+  build-frontend:
+    desc: Build the Fluent UI web console into frontend/dist (embedded into the binary)
+    dir: frontend
+    sources:
+      - src/**/*
+      - index.html
+      - package.json
+      - package-lock.json
+      - vite.config.ts
+      - tsconfig.json
+    generates:
+      - dist/index.html
     cmds:
-      - go build -o bin/{{.BINARY_NAME}} ./cmd/vproxy
+      - npm ci --no-audit --no-fund
+      - npm run build
+
+  build:
+    desc: Build the vproxy binary with embedded web console (bin/vproxy or bin/vproxy.exe on Windows)
+    deps: [build-frontend]
+    cmds:
+      - go build -trimpath -ldflags "{{.LDFLAGS}}" -o bin/{{.BINARY_NAME}} ./cmd/vproxy
 
   build-windows:
     desc: Build the Windows amd64 binary (bin/vproxy.exe)
+    deps: [build-frontend]
     cmds:
-      - '{{if eq OS "windows"}}go build -o bin/vproxy.exe ./cmd/vproxy{{else}}GOOS=windows GOARCH=amd64 go build -o bin/vproxy.exe ./cmd/vproxy{{end}}'
+      - '{{if eq OS "windows"}}go build -trimpath -ldflags "{{.LDFLAGS}}" -o bin/vproxy.exe ./cmd/vproxy{{else}}GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "{{.LDFLAGS}}" -o bin/vproxy.exe ./cmd/vproxy{{end}}'
 
   clean:
     desc: Clean up build artifacts
     cmds:
       - rm -rf bin/{{.BINARY_NAME}} bin/vproxy bin/vproxy.exe bin/test_*
+      - find frontend/dist -mindepth 1 ! -name .gitkeep -delete 2>/dev/null || true
 
   build-tests:
     desc: Build all test binaries
@@ -53,25 +73,26 @@ tasks:
 
   release:
     desc: Build and package release binaries for all platforms
+    deps: [build-frontend]
     cmds:
       - rm -rf dist && mkdir -p dist
       # Linux amd64
-      - GOOS=linux GOARCH=amd64 go build -o dist/vproxy ./cmd/vproxy
+      - GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "{{.LDFLAGS}}" -o dist/vproxy ./cmd/vproxy
       - tar -czf dist/vproxy_linux_amd64.tar.gz -C dist vproxy
       # Linux arm64
-      - GOOS=linux GOARCH=arm64 go build -o dist/vproxy ./cmd/vproxy
+      - GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "{{.LDFLAGS}}" -o dist/vproxy ./cmd/vproxy
       - tar -czf dist/vproxy_linux_arm64.tar.gz -C dist vproxy
       # Darwin amd64
-      - GOOS=darwin GOARCH=amd64 go build -o dist/vproxy ./cmd/vproxy
+      - GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "{{.LDFLAGS}}" -o dist/vproxy ./cmd/vproxy
       - tar -czf dist/vproxy_darwin_amd64.tar.gz -C dist vproxy
       # Darwin arm64
-      - GOOS=darwin GOARCH=arm64 go build -o dist/vproxy ./cmd/vproxy
+      - GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "{{.LDFLAGS}}" -o dist/vproxy ./cmd/vproxy
       - tar -czf dist/vproxy_darwin_arm64.tar.gz -C dist vproxy
       # Windows amd64
-      - GOOS=windows GOARCH=amd64 go build -o dist/vproxy.exe ./cmd/vproxy
+      - GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "{{.LDFLAGS}}" -o dist/vproxy.exe ./cmd/vproxy
       - zip -j dist/vproxy_windows_amd64.zip dist/vproxy.exe
       # Windows arm64
-      - GOOS=windows GOARCH=arm64 go build -o dist/vproxy.exe ./cmd/vproxy
+      - GOOS=windows GOARCH=arm64 go build -trimpath -ldflags "{{.LDFLAGS}}" -o dist/vproxy.exe ./cmd/vproxy
       - zip -j dist/vproxy_windows_arm64.zip dist/vproxy.exe
       # Cleanup individual binaries and generate checksums
       - rm -f dist/vproxy dist/vproxy.exe

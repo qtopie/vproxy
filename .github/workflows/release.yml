@@ -41,6 +41,13 @@ jobs:
           sudo apt-get install -y clang llvm libbpf-dev gcc-multilib
           sudo ln -s /usr/include/x86_64-linux-gnu/asm /usr/include/asm
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
       - name: Run Go Generate
         run: task generate
 
@@ -85,6 +92,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev gcc-multilib
           sudo ln -s /usr/include/x86_64-linux-gnu/asm /usr/include/asm
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Run Go Generate
         run: task generate

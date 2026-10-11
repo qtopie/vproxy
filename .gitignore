@@ -1,5 +1,7 @@
 bin/
-dist/
+/dist/
+frontend/dist/*
+!frontend/dist/.gitkeep
 test.sh
 config.json
 *.json
@@ -12,3 +14,4 @@ proxy/ebpf/tc_bpf_bpfel.go
 
 .agents/TASK.md
 scripts/__pycache__/
+.task/
