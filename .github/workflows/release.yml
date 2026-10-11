@@ -58,6 +58,9 @@ jobs:
           ls -l proxy/ebpf/tc_bpf_bpfel.go
           ls -l proxy/ebpf/tc_bpf_bpfel.o
 
+      - name: Build Frontend
+        run: task build-frontend
+
       - name: Run Tests
         run: go test -v ./...
 
