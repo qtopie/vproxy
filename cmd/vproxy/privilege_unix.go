@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -46,7 +47,8 @@ func isPIDAlive(pid int) bool {
 	if err != nil {
 		return false
 	}
-	return p.Signal(syscall.Signal(0)) == nil
+	sigErr := p.Signal(syscall.Signal(0))
+	return sigErr == nil || errors.Is(sigErr, syscall.EPERM)
 }
 
 func stopProcess(process *os.Process) error {
