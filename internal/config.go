@@ -21,6 +21,7 @@ type Config struct {
 	DialTimeoutMs  *int        `json:"dial_timeout_ms,omitempty"`
 	DialRetryCount *int        `json:"dial_retry_count,omitempty"`
 	BypassNodes    []string    `json:"bypass_nodes,omitempty"`
+	RemoteLANs     []string    `json:"remote_lans,omitempty"`
 	Rewrites       []string    `json:"rewrites,omitempty"`
 	Otel           *OtelConfig `json:"otel,omitempty"`
 }
@@ -32,6 +33,7 @@ type OtelConfig struct {
 	Insecure    bool    `json:"insecure,omitempty"`     // default true
 	ServiceName string  `json:"service_name,omitempty"` // default "vproxy"
 	SampleRate  float64 `json:"sample_rate,omitempty"`  // default 1.0 (100%)
+	SkipProbe   bool    `json:"skip_probe,omitempty"`   // for testing or skipping reachability probe
 }
 
 

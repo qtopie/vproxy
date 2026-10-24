@@ -41,6 +41,27 @@ var (
 	globalTracerMu sync.Mutex
 )
 
+type throttledOtelErrorHandler struct {
+	lastLogged atomic.Int64
+}
+
+func (h *throttledOtelErrorHandler) Handle(err error) {
+	if err == nil {
+		return
+	}
+	now := time.Now().Unix()
+	last := h.lastLogged.Load()
+	if now-last >= 30 {
+		if h.lastLogged.CompareAndSwap(last, now) {
+			Warnf("OpenTelemetry exporter warning (throttled): %v", err)
+		}
+	}
+}
+
+func init() {
+	otel.SetErrorHandler(&throttledOtelErrorHandler{})
+}
+
 func noopTracer() trace.Tracer {
 	return noop.NewTracerProvider().Tracer("vproxy")
 }
@@ -100,7 +121,7 @@ func buildOtelProvider(ctx context.Context, cfg *OtelConfig) (*sdktrace.TracerPr
 	res, err := resource.New(ctx,
 		resource.WithAttributes(
 			semconv.ServiceNameKey.String(serviceName),
-			attribute.String("service.version", "1.0.7"),
+			attribute.String("service.version", GetVersion()),
 		),
 	)
 	if err != nil {
@@ -122,6 +143,7 @@ func buildOtelProvider(ctx context.Context, cfg *OtelConfig) (*sdktrace.TracerPr
 	bsp := sdktrace.NewBatchSpanProcessor(exporter,
 		sdktrace.WithBatchTimeout(2*time.Second),
 		sdktrace.WithMaxExportBatchSize(512),
+		sdktrace.WithExportTimeout(500*time.Millisecond),
 	)
 
 	tp := sdktrace.NewTracerProvider(
@@ -262,9 +284,10 @@ func shutdownProvider(ctx context.Context, tp *sdktrace.TracerProvider) error {
 		return nil
 	}
 	shutdownCtx := ctx
-	if _, ok := ctx.Deadline(); !ok {
+	deadline, ok := ctx.Deadline()
+	if !ok || time.Until(deadline) > 500*time.Millisecond {
 		var cancel context.CancelFunc
-		shutdownCtx, cancel = context.WithTimeout(ctx, 2*time.Second)
+		shutdownCtx, cancel = context.WithTimeout(ctx, 500*time.Millisecond)
 		defer cancel()
 	}
 	return tp.Shutdown(shutdownCtx)

@@ -78,6 +78,7 @@ type MatchContext struct {
 // RuleManager manages a set of routing rules.
 type RuleManager struct {
 	rules         []Rule
+	remoteLANs    []*net.IPNet
 	defaultAction RuleAction
 	directDNS     bool
 	mu            sync.RWMutex
@@ -109,7 +110,7 @@ func NewRuleManager(ruleEntries []string) *RuleManager {
 		rules:     make([]Rule, 0),
 		directDNS: true,
 	}
-	rm.defaultAction = ActionProxy
+	rm.defaultAction = ActionDirect
 
 	for _, entry := range ruleEntries {
 		trimmed := strings.TrimSpace(entry)
@@ -221,6 +222,44 @@ func (rm *RuleManager) SetDirectDNS(direct bool) {
 	rm.directDNS = direct
 }
 
+// SetRemoteLANs registers remote private LAN subnets (e.g. "192.168.50.0/24") or domains (e.g. "*.home.arpa")
+// as high-priority ActionProxy rules so they are routed into the upstream vlink tunnel instead of bypassed locally.
+func (rm *RuleManager) SetRemoteLANs(entries []string) {
+	if rm == nil || len(entries) == 0 {
+		return
+	}
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	var prepended []Rule
+	for _, raw := range entries {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		if strings.Contains(entry, "/") {
+			if _, ipNet, err := net.ParseCIDR(entry); err == nil {
+				rm.remoteLANs = append(rm.remoteLANs, ipNet)
+				continue
+			}
+		} else if ip := net.ParseIP(entry); ip != nil {
+			cidr := entry + "/32"
+			if ip.To4() == nil {
+				cidr = entry + "/128"
+			}
+			if _, ipNet, err := net.ParseCIDR(cidr); err == nil {
+				rm.remoteLANs = append(rm.remoteLANs, ipNet)
+				continue
+			}
+		}
+		pattern := strings.TrimPrefix(entry, "*")
+		prepended = append(prepended, Rule{Type: RuleTypeDomain, Pattern: pattern, Action: ActionProxy})
+	}
+	if len(prepended) > 0 {
+		rm.rules = append(prepended, rm.rules...)
+	}
+}
+
 // HasProcessMetadataRules returns true if there is at least one PROCESS or PID rule configured.
 func (rm *RuleManager) HasProcessMetadataRules() bool {
 	if rm == nil {
@@ -267,8 +306,13 @@ func (rm *RuleManager) doMatchContext(ctx MatchContext) (RuleAction, string) {
 		return ActionDirect, ""
 	}
 
-	// 2. Check for IP and special ranges
+	// 2. Check for IP and special ranges (remote_lans take precedence over default private IP bypass)
 	if ip := net.ParseIP(ctx.Host); ip != nil {
+		for _, ipNet := range rm.remoteLANs {
+			if ipNet != nil && ipNet.Contains(ip) {
+				return ActionProxy, ""
+			}
+		}
 		if isPrivateIP(ip) {
 			return ActionDirect, ""
 		}

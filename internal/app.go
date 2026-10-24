@@ -158,6 +158,7 @@ func (a *App) RunServer() {
 
 	// Start IPC Server for unprivileged wrappers to request cgroup migration
 	if srv, err := ipc.StartServer(a.SelfHeal); err == nil {
+		srv.SetVersion(GetVersion())
 		a.ipcServer = srv
 		Infof("IPC server started on %s", ipc.SocketPath)
 	} else {
@@ -696,6 +697,9 @@ func (a *App) setupServices() (*ServerManager, *ProxyHandler) {
 	sm.SetSelfPorts(selfPorts)
 
 	rm := NewRuleManager(a.Config.Rules)
+	if len(a.Config.RemoteLANs) > 0 {
+		rm.SetRemoteLANs(a.Config.RemoteLANs)
+	}
 	if a.Config.DirectDNS != nil {
 		rm.SetDirectDNS(*a.Config.DirectDNS)
 	}

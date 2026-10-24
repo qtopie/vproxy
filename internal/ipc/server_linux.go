@@ -20,6 +20,14 @@ type Server struct {
 	stopCh        chan struct{}
 	startTime     time.Time
 	repairHandler func() error
+	version       string
+}
+
+// SetVersion configures the reported server version.
+func (s *Server) SetVersion(v string) {
+	if s != nil {
+		s.version = v
+	}
 }
 
 // StartServer starts the IPC server listening on SocketPath.
@@ -74,9 +82,13 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	switch genericReq.Type {
 	case TypeStatus:
+		ver := s.version
+		if ver == "" {
+			ver = "dev"
+		}
 		resp := StatusResponse{
 			Success: true,
-			Version: "1.0.0",
+			Version: ver,
 			Uptime:  time.Since(s.startTime).String(),
 		}
 		json.NewEncoder(conn).Encode(resp)

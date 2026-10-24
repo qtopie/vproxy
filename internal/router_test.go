@@ -195,3 +195,18 @@ func TestRuleManager_InactiveRuleFallback(t *testing.T) {
 	}
 }
 
+func TestSetRemoteLANs(t *testing.T) {
+	rm := NewRuleManager([]string{"FINAL,DIRECT"})
+	rm.SetRemoteLANs([]string{"192.168.50.0/24", "*.home.arpa"})
+
+	if action, _ := rm.Match("192.168.50.189"); action != ActionProxy {
+		t.Fatalf("expected 192.168.50.189 in remote_lans to route via PROXY, got %v", action)
+	}
+	if action, _ := rm.Match("drive.home.arpa"); action != ActionProxy {
+		t.Fatalf("expected drive.home.arpa in remote_lans to route via PROXY, got %v", action)
+	}
+	if action, _ := rm.Match("192.168.1.1"); action != ActionDirect {
+		t.Fatalf("expected non-matching local private IP 192.168.1.1 to remain DIRECT, got %v", action)
+	}
+}
+

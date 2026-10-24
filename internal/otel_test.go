@@ -425,3 +425,53 @@ func TestRelayWithStats(t *testing.T) {
 	_ = c2.Close()
 	time.Sleep(50 * time.Millisecond)
 }
+
+func TestOtelUnreachableEndpointResilience(t *testing.T) {
+	// Allocate a random port and close it immediately to guarantee unreachable endpoint
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	deadEndpoint := ln.Addr().String()
+	ln.Close()
+
+	cfg := &OtelConfig{
+		Enabled:  true,
+		Endpoint: deadEndpoint,
+		Protocol: "grpc",
+		Insecure: true,
+	}
+
+	start := time.Now()
+	shutdown, err := InitOtelTracer(context.Background(), cfg)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("InitOtelTracer should not fail hard on unreachable endpoint, got err: %v", err)
+	}
+	if elapsed > 1*time.Second {
+		t.Errorf("InitOtelTracer took %v, expected <= 1s", elapsed)
+	}
+
+	// Create and end a span to test that exporting to a dead endpoint does not block or panic
+	tracer := GetOtelTracer()
+	_, span := tracer.Start(context.Background(), "test.resilience.span")
+	span.End()
+
+	// Shutdown on unreachable endpoint must complete within bounded timeout (< 600ms)
+	start = time.Now()
+	_ = shutdown(context.Background())
+	shutdownElapsed := time.Since(start)
+	if shutdownElapsed > 600*time.Millisecond {
+		t.Errorf("shutdown took %v, expected <= 600ms", shutdownElapsed)
+	}
+}
+
+func TestThrottledOtelErrorHandler(t *testing.T) {
+	handler := &throttledOtelErrorHandler{}
+	// First error should trigger log without panic
+	handler.Handle(net.ErrClosed)
+	// Immediate subsequent error within 30s should be throttled
+	handler.Handle(net.ErrClosed)
+}
+

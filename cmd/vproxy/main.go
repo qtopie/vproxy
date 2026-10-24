@@ -21,8 +21,10 @@ var (
 	verbose    = flag.Bool("v", false, "verbose mode")
 	localHTTP  = flag.Int("http", 8118, "local HTTP proxy port")
 	localSocks = flag.Int("socks", 0, "local SOCKS5 proxy port (default: 0, disabled)")
-	localTrans = flag.Int("trans", 10080, "local transparent proxy port")
-	useTun     = flag.Bool("tun", false, "enable TUN mode (Linux only)")
+	localTrans  = flag.Int("trans", 10080, "local transparent proxy port")
+	useTun      = flag.Bool("tun", false, "enable TUN mode (Linux only)")
+	versionFlag = flag.Bool("version", false, "display version information and exit")
+	versionV    = flag.Bool("V", false, "display version information and exit")
 )
 
 func init() {
@@ -31,6 +33,11 @@ func init() {
 
 func main() {
 	flag.Parse()
+	if *versionFlag || *versionV {
+		printVersion()
+		return
+	}
+
 	args := flag.Args()
 
 	pidFile := vlink.GetPIDFilePath()
@@ -50,6 +57,10 @@ func main() {
 	command := args[0]
 
 	switch command {
+	case "version":
+		printVersion()
+		return
+
 	case "status":
 		fmt.Printf("vproxy status:\n")
 
@@ -181,6 +192,7 @@ func main() {
 func printUsage() {
 	fmt.Println("Usage: vproxy [options] <command> [args...]")
 	fmt.Println("\nCommands:")
+	fmt.Println("  version       Display version information")
 	fmt.Println("  start         Run vproxy server in foreground (includes Web UI)")
 	fmt.Println("  init          Perform privileged setup and start background daemon")
 	fmt.Println("  stop          Stop the background daemon")
@@ -189,6 +201,25 @@ func printUsage() {
 	fmt.Println("  <cmd> [args]  Run an external command through vproxy (e.g., vproxy curl ...)")
 	fmt.Println("\nOptions:")
 	flag.PrintDefaults()
+}
+
+func printVersion() {
+	info := vlink.GetVersionInfo()
+	details := []string{}
+	if info.GitCommit != "" {
+		dirty := ""
+		if info.GitDirty {
+			dirty = " (dirty)"
+		}
+		details = append(details, fmt.Sprintf("commit: %s%s", info.GitCommit, dirty))
+	}
+	if info.BuildDate != "" {
+		details = append(details, fmt.Sprintf("built: %s", info.BuildDate))
+	}
+	details = append(details, fmt.Sprintf("go: %s", info.GoVersion))
+	details = append(details, info.Platform)
+
+	fmt.Printf("vproxy version %s (%s)\n", info.Version, strings.Join(details, ", "))
 }
 
 func startBackgroundServer(config, pidFile string) error {

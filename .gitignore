@@ -1,4 +1,5 @@
 bin/
+/vproxy
 /dist/
 frontend/dist/*
 !frontend/dist/.gitkeep

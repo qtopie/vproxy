@@ -20,3 +20,7 @@ func StartServer(repairHandler func() error) (*Server, error) {
 // Stop is a no-op on non-Linux platforms.
 func (s *Server) Stop() {
 }
+
+// SetVersion is a no-op on non-Linux platforms.
+func (s *Server) SetVersion(v string) {
+}

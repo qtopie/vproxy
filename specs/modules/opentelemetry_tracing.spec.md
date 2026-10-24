@@ -124,6 +124,11 @@ OTel 全局 Tracer 状态被两类执行流并发访问：
 - **INV-OTEL-C2（发布顺序）**：新的 `TracerProvider` 必须**完整构建成功之后**才允许原子发布；构建过程中任何一步失败都必须返回 error 且**保留旧状态不变**，不得把系统降级为 noop。
 - **INV-OTEL-C3（Shutdown 不得阻塞热路径）**：禁止在持有热路径会等待的锁的情况下调用 `TracerProvider.Shutdown()`。正确顺序为：① 原子发布新快照 → ② 释放写锁 → ③ 在锁外关闭旧 Provider。
 - **INV-OTEL-C4（竞争检测）**：`go test -race ./internal/...` 在「init/shutdown 与并发 `GetOtelTracer()`/`IsOtelActive()` 交织」的压力用例下必须**零告警**。
+- **INV-OTEL-C5（不可达静默容错与无阻塞）**：
+  1. **短导出超时**：`BatchSpanProcessor` 必须配置 `WithExportTimeout(500 * time.Millisecond)`（取代默认 30s），消除收集端离线时导出线程长达 30 秒的挂起；
+  2. **可用性探测与自适应降级**：初始化或重载时对目标 `endpoint` 进行非阻塞连接探测。若端点无法连通（如 `connect: connection refused`），则保持 NoopTracer 且不激活批量上报，避免积压无意义 Span；
+  3. **全局日志防刷屏 (Error Throttling)**：注册自定义 OTel 错误处理器，对反复出现的 exporter 导出超时与连接拒绝错误进行限频过滤（如 30 秒仅打印一次），杜绝日志洪泛；
+  4. **极速停机**：`shutdownProvider` 设限最长 500ms 超时，确保进程终止与退出清理不受 OTel 挂起拖延。
 
 **实现方式（唯一读写入口）**：以 `atomic.Pointer[otelState]` 承载不可变快照（`otelState{ tracer trace.Tracer; active bool }`），读侧 `Load()`、写侧 `Store()`；`InitOtelTracer` 与 `shutdown` 共用一个互斥锁**仅串行化写入者**，绝不串行化热路径读取。
 
@@ -172,3 +177,12 @@ OTel 全局 Tracer 状态被两类执行流并发访问：
 - **And** 任一时刻读到的 `(tracer, active)` 组合始终自洽：`active == true` 蕴含 tracer 非 noop（INV-OTEL-C1）
 - **And** `Shutdown` 执行期间热路径读取不阻塞（INV-OTEL-C3）
 - **And** 当 `InitOtelTracer()` 因 exporter 创建失败而返回 error 时，旧状态保持不变（INV-OTEL-C2）
+
+#### Scenario 8: [SPEC-OTEL-008] 收集端不可达时的非阻塞容错与静默降级
+- **Given** 配置了 `otel.enabled = true`，但端点 `127.0.0.1:4317` 无服务监听（如 Connection Refused）
+- **When** 启动代理服务或转发流量
+- **Then** `BatchSpanProcessor` 导出超时不超过 500ms，连接转发与隧道关闭不受收集端影响
+- **And** 重复的导出错误被限频过滤（同一错误 30s 内不重复刷屏）
+- **And** `shutdownProvider` 在 500ms 内快速返回，进程退出时不被挂起
+- **Mapped Test:** `internal/otel_test.go:TestOtelUnreachableEndpointResilience`
+
