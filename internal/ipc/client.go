@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const SocketPath = "/tmp/vproxy.sock"
+var SocketPath = "/tmp/vproxy.sock"
 
 type RequestType string
 
@@ -66,6 +66,24 @@ func RequestAttach(pid int) error {
 	}
 
 	return nil
+}
+
+// RequestAttachWithRetry attempts to attach a process to vproxy cgroup,
+// retrying up to maxRetries with exponential backoff on transient errors.
+func RequestAttachWithRetry(pid int, maxRetries int, initialBackoff time.Duration) error {
+	var err error
+	backoff := initialBackoff
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		err = RequestAttach(pid)
+		if err == nil {
+			return nil
+		}
+		if attempt < maxRetries {
+			time.Sleep(backoff)
+			backoff *= 2
+		}
+	}
+	return err
 }
 
 // RequestStatus sends a status request to the background vproxy daemon.

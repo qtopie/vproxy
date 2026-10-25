@@ -361,7 +361,7 @@ func (a *App) RunWrapper(args []string) {
 	if needsEbpf && a.Config.EnableEbpf != nil && *a.Config.EnableEbpf && runtime.GOOS == "linux" {
 		if err := cgroup.MoveProcessToVProxyCgroup(os.Getpid()); err != nil {
 			Debugf("Direct cgroup migration failed (%v), trying IPC attach...", err)
-			if ipcErr := ipc.RequestAttach(os.Getpid()); ipcErr != nil {
+			if ipcErr := ipc.RequestAttachWithRetry(os.Getpid(), 3, 100*time.Millisecond); ipcErr != nil {
 				Debugf("IPC attach failed: %v", ipcErr)
 
 				// TRIGGER SELF-HEAL: If IPC attach fails, the environment might be tampered.
@@ -370,7 +370,7 @@ func (a *App) RunWrapper(args []string) {
 					Infof("Environment seems tampered, requesting daemon to self-heal...")
 					if repairErr := ipc.RequestRepair(); repairErr == nil {
 						// Retry attach once after repair
-						ipcErr = ipc.RequestAttach(os.Getpid())
+						ipcErr = ipc.RequestAttachWithRetry(os.Getpid(), 2, 100*time.Millisecond)
 					}
 				}
 

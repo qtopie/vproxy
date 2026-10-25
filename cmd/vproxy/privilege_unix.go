@@ -13,7 +13,11 @@ import (
 	vlink "github.com/qtopie/vproxy/internal"
 )
 
-func prepareDaemonCommand(cmd *exec.Cmd) {}
+func prepareDaemonCommand(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid: true,
+	}
+}
 
 func requireElevatedPrivileges(command string) {
 	if os.Geteuid() != 0 {

@@ -257,11 +257,14 @@ func startBackgroundServer(config, pidFile string) error {
 	cmd.Env = append(os.Environ(), "VP_BACKGROUND=1", "VP_READY_FILE="+readyFile)
 
 	// In daemon mode, child process automatically sets up bounded rotating file logging in InitBackgroundLogging.
-	// We open stdout/stderr to a temporary discard or initial log handle without raw unbounded append.
+	// Stdout/Stderr must be bound to a concrete *os.File to avoid parent pipe closure triggering SIGPIPE.
 	logFile := filepath.Join(os.TempDir(), "vproxy.log")
-	if rw, err := vlink.NewRotatingWriter(logFile, 10*1024*1024, 1); err == nil {
-		cmd.Stdout = rw
-		cmd.Stderr = rw
+	if logF, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+		cmd.Stdout = logF
+		cmd.Stderr = logF
+	} else if devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0); err == nil {
+		cmd.Stdout = devNull
+		cmd.Stderr = devNull
 	}
 
 	err := cmd.Start()

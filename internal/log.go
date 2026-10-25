@@ -113,9 +113,9 @@ func output(l Level, calldepth int, format string, v ...interface{}) {
 	out := logOutput
 	mu.RUnlock()
 
-	// If output is redirected (not os.Stderr) and we have an error or fatal,
-	// print to os.Stderr too so the user sees the error.
-	if out != os.Stderr && l >= LevelError {
+	// In background daemon mode, suppress stderr mirroring completely to avoid broken pipe issues.
+	// In interactive wrapper mode, mirror errors to os.Stderr so the user sees them.
+	if os.Getenv("VP_BACKGROUND") != "1" && out != os.Stderr && l >= LevelError {
 		fmt.Fprintf(os.Stderr, "vproxy: %s\n", msg)
 	}
 
@@ -191,6 +191,7 @@ func InitBackgroundLogging() {
 	if os.Getenv("VP_BACKGROUND") != "1" {
 		return
 	}
+	ignoreSIGPIPE()
 	logFile := filepath.Join(os.TempDir(), "vproxy.log")
 	// Bound each log file to 10MB, keep 1 backup file -> Max 20MB total footprint
 	rw, err := NewRotatingWriter(logFile, 10*1024*1024, 1)

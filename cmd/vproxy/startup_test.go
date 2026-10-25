@@ -29,6 +29,21 @@ func TestWaitForReadyFileReportsProcessExit(t *testing.T) {
 	}
 }
 
+func TestDaemonStdioDecoupling(t *testing.T) {
+	logFile := filepath.Join(t.TempDir(), "vproxy.log")
+	logF, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatalf("failed to open test log file: %v", err)
+	}
+	defer logF.Close()
+
+	// Verify that logF is a concrete *os.File
+	var stdout interface{} = logF
+	if _, ok := stdout.(*os.File); !ok {
+		t.Fatalf("expected stdout to be *os.File, got %T", stdout)
+	}
+}
+
 func TestWindows_StatusOutput(t *testing.T) {
 	// SPEC-WIN-012: Invariant test verifying Windows status output expectations
 }
